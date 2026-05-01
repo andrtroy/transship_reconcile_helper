@@ -1,0 +1,982 @@
+// ==UserScript==
+// @name         IHM Shortage Review
+// @namespace    https://grocerycentral.amazon.dev/
+// @version      3.1.0
+// @description  Adds a Shortage Review button to the IHM transship page, and auto-fills filters on the Inventory Audit Dashboard when opened from that button
+// @match        https://grocerycentral.amazon.dev/ihm-transship-dashboards/inbound-manifest-view-v2/*
+// @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page
+// @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const url = window.location.href;
+
+  // Route to the correct logic based on which page we're on
+  if (url.includes('/inbound-manifest-view-v2/')) {
+    runTransshipPage();
+  } else if (url.includes('/inventory-audit-main-page')) {
+    runAuditPage();
+  }
+
+  // ===========================================================================
+  // TRANSSHIP PAGE — Shortage Review button + panel
+  // ===========================================================================
+
+  function runTransshipPage() {
+
+    // -------------------------------------------------------------------------
+    // Expand all totes, wait for DOM to settle
+    // -------------------------------------------------------------------------
+
+    function expandAllTotes() {
+      return new Promise((resolve) => {
+        let expandBtn = null;
+
+        // Try multiple strategies to find the Expand All button
+        // The button contains spans: one with "Expand" and one with "Collapse All"
+        // so textContent is "ExpandCollapse All" — search for just "Expand"
+        for (const el of document.querySelectorAll('button')) {
+          const text = el.textContent.trim().toLowerCase();
+          if (text.includes('expand') && text.includes('collapse')) {
+            expandBtn = el;
+            break;
+          }
+        }
+
+        // Fallback: look for a button whose text starts with "expand"
+        if (!expandBtn) {
+          for (const el of document.querySelectorAll('button, a, span')) {
+            const text = el.textContent.trim().toLowerCase();
+            if (text.startsWith('expand') && text.length < 30) {
+              expandBtn = el;
+              break;
+            }
+          }
+        }
+
+        if (!expandBtn) {
+          console.log('[IHM Transship] Expand All button not found — totes may already be expanded or button has different text');
+          resolve();
+          return;
+        }
+
+        console.log('[IHM Transship] Found Expand All button, clicking:', expandBtn.textContent.trim());
+        // Use full mouse event sequence in case it's an Ember component
+        expandBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        expandBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        expandBtn.click();
+
+        let quietTimer = null;
+        const obs = new MutationObserver(() => {
+          clearTimeout(quietTimer);
+          quietTimer = setTimeout(() => { obs.disconnect(); resolve(); }, 400);
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+        setTimeout(() => { obs.disconnect(); clearTimeout(quietTimer); resolve(); }, 5000);
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // Scrape shortage rows from expanded DOM
+    // -------------------------------------------------------------------------
+
+    function scrapeShortages() {
+      const shortages = [];
+      const asinPattern = /^[A-Z0-9]{10}$/i;
+
+      document.querySelectorAll('tr').forEach((row) => {
+        const cells = Array.from(row.querySelectorAll('td'));
+        if (cells.length < 4) return;
+
+        const asin = cells[0].textContent.trim().replace(/\s+/g, '');
+        if (!asinPattern.test(asin)) return;
+
+        const title = cells[1] ? cells[1].textContent.trim() : '';
+        const expectedQty = parseInt(cells[2] ? cells[2].textContent.trim() : '0', 10);
+        const unpackedQty = parseInt(cells[3] ? cells[3].textContent.trim() : '0', 10);
+
+        // Partial shortage: some units unpacked but not all
+        // unpackedQty > 0 AND unpackedQty < expectedQty
+        if (isNaN(expectedQty) || isNaN(unpackedQty)) return;
+        if (unpackedQty <= 0) return; // nothing received yet — not a partial shortage
+        if (unpackedQty >= expectedQty) return; // fully received — not a shortage
+
+        // Find nearest tote ID from ancestor elements
+        let toteId = '';
+        let ancestor = row.parentElement;
+        while (ancestor && ancestor !== document.body) {
+          const toteLink = ancestor.querySelector('a[href*="tote"], [class*="tote"] a, [id*="tote"]');
+          if (toteLink) { toteId = toteLink.textContent.trim(); break; }
+          const headings = ancestor.querySelectorAll('h1,h2,h3,h4,strong,b,[class*="title"],[class*="header"]');
+          for (const h of headings) {
+            const t = h.textContent.trim();
+            if (/^[a-z0-9]{8,16}$/i.test(t) && t !== asin) { toteId = t; break; }
+          }
+          if (toteId) break;
+          ancestor = ancestor.parentElement;
+        }
+
+        shortages.push({ asin, title, expectedQty, unpackedQty, toteId });
+      });
+
+      return shortages;
+    }
+
+    // -------------------------------------------------------------------------
+    // CSS
+    // -------------------------------------------------------------------------
+
+    GM_addStyle(`
+      #ihm-shortage-overlay {
+        position: fixed; inset: 0; z-index: 999999;
+        background: rgba(0,0,0,0.5);
+      }
+      #ihm-shortage-panel {
+        position: absolute; top: 50%; left: 50%;
+        transform: translate(-50%,-50%);
+        min-width: 680px; max-width: 92vw; max-height: 82vh;
+        overflow-y: auto; background: #fff; border-radius: 8px;
+        padding: 24px; box-shadow: 0 4px 24px rgba(0,0,0,0.2);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .ihm-panel-header {
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 16px; border-bottom: 1px solid #e0e0e0; padding-bottom: 12px;
+      }
+      .ihm-panel-header h2 { margin: 0; font-size: 18px; font-weight: 600; color: #111; }
+      .ihm-close-btn {
+        background: none; border: none; font-size: 22px;
+        cursor: pointer; color: #555; line-height: 1; padding: 0 4px;
+      }
+      .ihm-close-btn:hover { color: #000; }
+      .ihm-panel-body { margin-top: 8px; }
+      .ihm-shortage-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .ihm-shortage-table th, .ihm-shortage-table td {
+        padding: 8px 12px; text-align: left;
+        border-bottom: 1px solid #e8e8e8; vertical-align: top;
+      }
+      .ihm-shortage-table th {
+        background: #f5f5f5; font-weight: 600; font-size: 12px;
+        text-transform: uppercase; letter-spacing: 0.04em; color: #444;
+      }
+      .ihm-shortage-table tr:hover td { background: #fafafa; }
+      .ihm-asin { font-family: monospace; font-size: 12px; }
+      .ihm-title {
+        max-width: 260px; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; color: #333;
+      }
+      .ihm-qty-short { color: #c00; font-weight: 600; }
+      .ihm-audit-link { color: #0073bb; text-decoration: none; font-size: 12px; white-space: nowrap; }
+      .ihm-audit-link:hover { text-decoration: underline; }
+      .ihm-empty-msg { padding: 32px 0; text-align: center; color: #555; font-size: 14px; }
+      .ihm-shortage-review-btn {
+        background: #fff; border: 1px solid #0073bb; color: #0073bb;
+        padding: 6px 14px; border-radius: 4px; cursor: pointer;
+        font-size: 13px; font-weight: 500; margin-left: 8px;
+      }
+      .ihm-shortage-review-btn:hover { background: #e8f4fb; }
+      .ihm-summary { font-size: 12px; color: #666; margin-bottom: 12px; }
+      @keyframes ihm-spin {
+        0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); }
+      }
+    `);
+
+    // -------------------------------------------------------------------------
+    // Panel
+    // -------------------------------------------------------------------------
+
+    function createPanel() {
+      let overlay = null, prevFocus = null;
+
+      function onKeyDown(e) { if (e.key === 'Escape') hide(); }
+
+      function trapFocus(e) {
+        if (!overlay || e.key !== 'Tab') return;
+        const focusable = Array.from(overlay.querySelectorAll('button,a[href],[tabindex]:not([tabindex="-1"])')).filter(el => !el.disabled);
+        if (!focusable.length) return;
+        const first = focusable[0], last = focusable[focusable.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+
+      function buildSkeleton() {
+        const ov = document.createElement('div');
+        ov.id = 'ihm-shortage-overlay';
+        const panel = document.createElement('div');
+        panel.id = 'ihm-shortage-panel';
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-modal', 'true');
+        panel.setAttribute('aria-labelledby', 'ihm-panel-title');
+        const header = document.createElement('div');
+        header.className = 'ihm-panel-header';
+        const title = document.createElement('h2');
+        title.id = 'ihm-panel-title';
+        title.textContent = 'Shortage Review';
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'ihm-close-btn';
+        closeBtn.setAttribute('aria-label', 'Close shortage review panel');
+        closeBtn.textContent = '×';
+        closeBtn.addEventListener('click', hide);
+        header.appendChild(title);
+        header.appendChild(closeBtn);
+        const body = document.createElement('div');
+        body.className = 'ihm-panel-body';
+        panel.appendChild(header);
+        panel.appendChild(body);
+        ov.appendChild(panel);
+        return ov;
+      }
+
+      function show() {
+        if (overlay) return;
+        prevFocus = document.activeElement;
+        overlay = buildSkeleton();
+        document.body.appendChild(overlay);
+        overlay.querySelector('.ihm-close-btn').focus();
+        document.addEventListener('keydown', onKeyDown);
+        document.addEventListener('keydown', trapFocus);
+      }
+
+      function hide() {
+        if (!overlay) return;
+        document.removeEventListener('keydown', onKeyDown);
+        document.removeEventListener('keydown', trapFocus);
+        overlay.remove();
+        overlay = null;
+        if (prevFocus && prevFocus.focus) prevFocus.focus();
+        prevFocus = null;
+      }
+
+      function renderLoading() {
+        if (!overlay) return;
+        const body = overlay.querySelector('.ihm-panel-body');
+        body.innerHTML = '';
+        const wrapper = document.createElement('div');
+        wrapper.style.cssText = 'text-align:center;padding:40px 0';
+        const spinner = document.createElement('div');
+        spinner.style.cssText = 'display:inline-block;width:32px;height:32px;border:3px solid #e0e0e0;border-top-color:#0073bb;border-radius:50%;animation:ihm-spin 0.8s linear infinite';
+        spinner.setAttribute('role', 'status');
+        const label = document.createElement('p');
+        label.textContent = 'Expanding totes and loading shortage data…';
+        label.style.cssText = 'margin-top:12px;color:#555;font-size:13px';
+        wrapper.appendChild(spinner);
+        wrapper.appendChild(label);
+        body.appendChild(wrapper);
+      }
+
+      function render(shortages) {
+        if (!overlay) return;
+        const body = overlay.querySelector('.ihm-panel-body');
+        body.innerHTML = '';
+
+        if (shortages.length === 0) {
+          const msg = document.createElement('p');
+          msg.className = 'ihm-empty-msg';
+          msg.textContent = 'No partial case shortages found for this transship.';
+          body.appendChild(msg);
+          return;
+        }
+
+        const summary = document.createElement('p');
+        summary.className = 'ihm-summary';
+        summary.textContent = `${shortages.length} item${shortages.length !== 1 ? 's' : ''} with unpacked units. Click "Open Audit →" to load stow locations — they'll appear automatically in the Stow Location column.`;
+        body.appendChild(summary);
+
+        const table = document.createElement('table');
+        table.className = 'ihm-shortage-table';
+
+        const thead = document.createElement('thead');
+        const hRow = document.createElement('tr');
+        ['ASIN', 'Title', 'Expected', 'Unpacked', 'Tote', 'Stow Location', 'Audit Dashboard'].forEach(text => {
+          const th = document.createElement('th');
+          th.textContent = text;
+          hRow.appendChild(th);
+        });
+        thead.appendChild(hRow);
+        table.appendChild(thead);
+
+        const tbody = document.createElement('tbody');
+        shortages.forEach(item => {
+          const tr = document.createElement('tr');
+
+          const tdAsin = document.createElement('td');
+          tdAsin.className = 'ihm-asin';
+          tdAsin.textContent = item.asin;
+          tr.appendChild(tdAsin);
+
+          const tdTitle = document.createElement('td');
+          tdTitle.className = 'ihm-title';
+          tdTitle.textContent = item.title || '—';
+          tdTitle.title = item.title;
+          tr.appendChild(tdTitle);
+
+          const tdExp = document.createElement('td');
+          tdExp.textContent = item.expectedQty;
+          tr.appendChild(tdExp);
+
+          const tdUnpacked = document.createElement('td');
+          tdUnpacked.className = 'ihm-qty-short';
+          tdUnpacked.textContent = item.unpackedQty;
+          tr.appendChild(tdUnpacked);
+
+          const tdTote = document.createElement('td');
+          tdTote.textContent = item.toteId || '—';
+          tdTote.style.cssText = 'font-size:12px;font-family:monospace';
+          tr.appendChild(tdTote);
+
+          // Stow Location — populated from localStorage when audit tab returns data
+          const tdStow = document.createElement('td');
+          tdStow.id = `ihm-stow-${item.asin}`;
+          tdStow.style.cssText = 'font-size:12px;color:#555';
+
+          function updateStowCell() {
+            const stored = localStorage.getItem(`ihm_stow_${item.asin}`);
+            if (stored) {
+              try {
+                const data = JSON.parse(stored);
+                if (data.stowLocations && data.stowLocations.length > 0) {
+                  tdStow.innerHTML = data.stowLocations
+                    .map(s => `<div style="white-space:nowrap"><strong>${s.location}</strong> &times; ${s.quantity}</div>`)
+                    .join('');
+                  tdStow.style.color = '#2e7d32';
+                } else {
+                  tdStow.textContent = 'No stow found';
+                }
+              } catch (_) {
+                tdStow.textContent = '—';
+              }
+            } else {
+              tdStow.textContent = 'Open Audit to load';
+              tdStow.style.color = '#999';
+            }
+          }
+
+          updateStowCell();
+          tr.appendChild(tdStow);
+
+          const tdLink = document.createElement('td');
+          const auditUrl = `https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page#asin=${encodeURIComponent(item.asin)}`;
+          const link = document.createElement('a');
+          link.href = auditUrl;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.className = 'ihm-audit-link';
+          link.textContent = 'Open Audit →';
+          tdLink.appendChild(link);
+          tr.appendChild(tdLink);
+
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        body.appendChild(table);
+
+        // Listen for localStorage changes from the audit tab and update stow cells live
+        window.addEventListener('storage', (e) => {
+          if (e.key && e.key.startsWith('ihm_stow_')) {
+            const asinKey = e.key.replace('ihm_stow_', '');
+            const cell = document.getElementById(`ihm-stow-${asinKey}`);
+            if (cell) {
+              shortages.forEach(item => {
+                if (item.asin === asinKey) {
+                  const stored = e.newValue;
+                  if (stored) {
+                    try {
+                      const data = JSON.parse(stored);
+                      if (data.stowLocations && data.stowLocations.length > 0) {
+                        cell.innerHTML = data.stowLocations
+                          .map(s => `<div style="white-space:nowrap"><strong>${s.location}</strong> &times; ${s.quantity}</div>`)
+                          .join('');
+                        cell.style.color = '#2e7d32';
+                      }
+                    } catch (_) {}
+                  }
+                }
+              });
+            }
+          }
+        });
+      }
+
+      return { show, hide, render, renderLoading };
+    }
+
+    // -------------------------------------------------------------------------
+    // Wait for Reconcile button
+    // -------------------------------------------------------------------------
+
+    function waitForReconcileButton(callback) {
+      function find() {
+        const byAction = document.querySelector('button[data-action="reconcile"]');
+        if (byAction) return byAction;
+        const byTestId = document.querySelector('button[data-testid*="reconcile"],button[data-testid*="Reconcile"]');
+        if (byTestId) return byTestId;
+        for (const btn of document.querySelectorAll('button')) {
+          const t = btn.textContent.trim().toLowerCase();
+          if (t === 'reconcile ts' || t === 'reconcile' || t.startsWith('reconcile')) return btn;
+        }
+        for (const el of document.querySelectorAll('a, [role="button"]')) {
+          const t = el.textContent.trim().toLowerCase();
+          if (t.startsWith('reconcile')) return el;
+        }
+        console.log('[IHM Transship] Buttons found:', Array.from(document.querySelectorAll('button')).map(b => b.textContent.trim()).filter(t => t).slice(0, 15));
+        return null;
+      }
+
+      const existing = find();
+      if (existing) { callback(existing); return; }
+
+      const tid = setTimeout(() => {
+        obs.disconnect();
+        console.warn('[IHM Shortage Review] Reconcile button not found after 10s.');
+      }, 10000);
+
+      const obs = new MutationObserver(() => {
+        const btn = find();
+        if (btn) { obs.disconnect(); clearTimeout(tid); callback(btn); }
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // -------------------------------------------------------------------------
+    // Entry point for transship page
+    // -------------------------------------------------------------------------
+
+    try {
+      waitForReconcileButton((reconcileBtn) => {
+        if (document.getElementById('ihm-shortage-review-btn')) return;
+
+        const panel = createPanel();
+
+        const btn = document.createElement('button');
+        btn.id = 'ihm-shortage-review-btn';
+        btn.className = 'ihm-shortage-review-btn';
+        btn.textContent = 'Shortage Review';
+        btn.addEventListener('click', async () => {
+          panel.show();
+          panel.renderLoading();
+          await expandAllTotes();
+          const shortages = scrapeShortages();
+          panel.render(shortages);
+        });
+
+        reconcileBtn.insertAdjacentElement('afterend', btn);
+      });
+    } catch (err) {
+      console.warn('[IHM Shortage Review] Error on transship page:', err);
+    }
+  }
+
+  // ===========================================================================
+  // AUDIT DASHBOARD PAGE — Auto-fill filters when opened from Shortage Review
+  // ===========================================================================
+
+  function runAuditPage() {
+
+    // Only run if the ASIN was passed via the URL hash from our script
+    function getAsinFromHash() {
+      const hash = window.location.hash;
+      const match = /[#&]asin=([^&]+)/.exec(hash);
+      if (!match) return null;
+      // Decode and strip any whitespace/control characters
+      const raw = decodeURIComponent(match[1]).replace(/[\s\r\n\t]/g, '');
+      // Validate it looks like an ASIN (10 alphanumeric chars)
+      return /^[A-Z0-9]{10}$/i.test(raw) ? raw : null;
+    }
+
+    const asin = getAsinFromHash();
+    if (!asin) return; // Not opened from shortage review — do nothing
+
+    // -------------------------------------------------------------------------
+    // Date helpers
+    // -------------------------------------------------------------------------
+
+    function formatDate(date) {
+      const mm = String(date.getMonth() + 1).padStart(2, '0');
+      const dd = String(date.getDate()).padStart(2, '0');
+      return `${mm}/${dd}/${date.getFullYear()}`;
+    }
+
+    function getDateRange() {
+      const now = new Date();
+      const from = new Date(now);
+      from.setDate(from.getDate() - 3);
+      return { fromDate: formatDate(from), fromTime: '00:00', toDate: formatDate(now), toTime: '23:59' };
+    }
+
+    // -------------------------------------------------------------------------
+    // React-compatible input setter
+    // -------------------------------------------------------------------------
+
+    function setInputValue(input, value) {
+      if (!input) return;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(input, value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function findInputByPlaceholder(text) {
+      const lower = text.toLowerCase();
+      for (const el of document.querySelectorAll('input,textarea')) {
+        if ((el.placeholder || '').toLowerCase().includes(lower)) return el;
+      }
+      return null;
+    }
+
+    function findButtonByText(text) {
+      const lower = text.toLowerCase();
+      for (const btn of document.querySelectorAll('button')) {
+        if (btn.textContent.trim().toLowerCase().includes(lower)) return btn;
+      }
+      return null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Auto-fill dates and ASIN only (no process selection)
+    // -------------------------------------------------------------------------
+
+    function autoFillDatesAndAsin() {
+      const { fromDate, fromTime, toDate, toTime } = getDateRange();
+      const allInputs = Array.from(document.querySelectorAll(
+        'input[type="text"], input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"])'
+      ));
+      const dateInputs = allInputs.filter(el =>
+        /\d{2}\/\d{2}\/\d{4}/.test(el.value) || el.placeholder === 'MM/DD/YYYY' ||
+        (el.getAttribute('aria-label') || '').toLowerCase().includes('date')
+      );
+      if (dateInputs.length >= 2) { setInputValue(dateInputs[0], fromDate); setInputValue(dateInputs[1], toDate); }
+      const timeInputs = allInputs.filter(el =>
+        /^\d{2}:\d{2}$/.test(el.value) || el.placeholder === 'HH:MM' ||
+        (el.getAttribute('aria-label') || '').toLowerCase().includes('time')
+      );
+      if (timeInputs.length >= 2) { setInputValue(timeInputs[0], fromTime); setInputValue(timeInputs[1], toTime); }
+      const asinInput = findInputByPlaceholder('asin number') || findInputByPlaceholder('asin') || findInputByPlaceholder('product');
+      if (asinInput) setInputValue(asinInput, asin);
+    }
+
+    // -------------------------------------------------------------------------
+    // Auto-fill (full — dates, ASIN, and processes)
+    // -------------------------------------------------------------------------
+
+    function autoFill() {
+      console.log('[IHM Audit] autoFill running for ASIN:', asin);
+      const { fromDate, fromTime, toDate, toTime } = getDateRange();
+      console.log('[IHM Audit] Date range:', fromDate, fromTime, '→', toDate, toTime);
+
+      // All text inputs on the page
+      const allInputs = Array.from(document.querySelectorAll(
+        'input[type="text"], input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"])'
+      ));
+
+      // Date inputs — identified by MM/DD/YYYY value pattern or placeholder
+      const dateInputs = allInputs.filter(el =>
+        /\d{2}\/\d{2}\/\d{4}/.test(el.value) ||
+        el.placeholder === 'MM/DD/YYYY' ||
+        (el.getAttribute('aria-label') || '').toLowerCase().includes('date')
+      );
+
+      if (dateInputs.length >= 2) {
+        setInputValue(dateInputs[0], fromDate);
+        setInputValue(dateInputs[1], toDate);
+      }
+
+      // Time inputs — identified by HH:MM value pattern or placeholder
+      const timeInputs = allInputs.filter(el =>
+        /^\d{2}:\d{2}$/.test(el.value) ||
+        el.placeholder === 'HH:MM' ||
+        (el.getAttribute('aria-label') || '').toLowerCase().includes('time')
+      );
+
+      if (timeInputs.length >= 2) {
+        setInputValue(timeInputs[0], fromTime);
+        setInputValue(timeInputs[1], toTime);
+      }
+
+      // ASIN field — target by exact placeholder "Enter asin number" (confirmed from page DOM)
+      const asinInput = findInputByPlaceholder('asin number') ||
+                        findInputByPlaceholder('asin') ||
+                        findInputByPlaceholder('product') ||
+                        findInputByPlaceholder('item') ||
+                        document.querySelector('[data-testid*="asin" i] input, [aria-label*="asin" i] input');
+      if (asinInput) {
+        setInputValue(asinInput, asin);
+        console.log('[IHM Audit] Set ASIN field to:', asin, '| placeholder was:', asinInput.placeholder);
+      } else {
+        console.warn('[IHM Audit] ASIN input not found');
+      }
+
+      // Target processes — only ReceiveV3_Stow
+      const TARGET_PROCESSES = [
+        'ReceiveV3_Stow'
+      ];
+
+      // Find and click the dropdown trigger to open it
+      function findDropdownTrigger() {
+        // Primary: data-testid confirmed from DOM inspection
+        const byTestId = document.querySelector('[data-testid="process-select"]');
+        if (byTestId) return byTestId;
+        // Fallbacks
+        for (const el of document.querySelectorAll('button, div[role="button"], [tabindex="0"], .mds-input-box')) {
+          const text = el.textContent.trim();
+          if (text.includes('Select Process') || /^\d+ selected$/.test(text)) return el;
+        }
+        return null;
+      }
+
+      function triggerClick(el) {
+        // Try clicking a checkbox inside the item first (Ember multi-select components
+        // often use hidden checkboxes as the actual selection mechanism)
+        const checkbox = el.querySelector('input[type="checkbox"]') ||
+                         el.closest('li, [role="option"]')?.querySelector('input[type="checkbox"]');
+        if (checkbox) {
+          checkbox.click();
+          return;
+        }
+        // Fall back to native click on the element itself
+        if (typeof el.click === 'function') {
+          el.click();
+        } else {
+          el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        }
+      }
+
+      function triggerDropdownOpen(el) {
+        // Ember dropdowns need the full mouse event sequence to open
+        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        const child = el.querySelector('input, button, [tabindex], [role="combobox"], [role="button"]');
+        if (child) {
+          child.focus();
+          child.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+          child.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+          child.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        }
+      }
+
+      // Open dropdown, wait for items, click the 7 targets, then click Filter
+      function selectProcessesThenFilter() {
+        const trigger = findDropdownTrigger();
+        if (trigger) {
+          triggerDropdownOpen(trigger);
+          console.log('[IHM Audit] Opened process dropdown, trigger text:', trigger.textContent.trim());
+        } else {
+          console.warn('[IHM Audit] Process dropdown trigger not found — all button texts:',
+            Array.from(document.querySelectorAll('button')).map(b => b.textContent.trim()).filter(t => t).slice(0, 15));
+          // Click Filter anyway with whatever processes are selected
+          const filterBtn = findButtonByText('filter');
+          if (filterBtn) { filterBtn.click(); console.log('[IHM Audit] Clicked Filter (no dropdown found)'); }
+          return;
+        }
+
+        // Poll for list items to appear in the DOM
+        let attempts = 0;
+        const poll = setInterval(() => {
+          attempts++;
+
+          // Find all leaf text elements matching our target process names
+          // Check entire document including portals rendered at body level
+          const matches = Array.from(document.querySelectorAll(
+            'button, li, [role="option"], [role="menuitem"], [role="listitem"], ' +
+            '.mds-list-item, [class*="list-item"], [class*="option"], ' +
+            '[class*="menu-item"], [class*="dropdown-item"]'
+          )).filter(el => {
+            const text = el.textContent.trim();
+            return TARGET_PROCESSES.some(p => text === p || text === p.toLowerCase());
+          });
+
+          // Also check plain span/div leaf nodes and buttons
+          const leafMatches = Array.from(document.querySelectorAll('span, div, button'))
+            .filter(el => {
+              const text = el.textContent.trim();
+              return TARGET_PROCESSES.some(p => text === p || text === p.toLowerCase());
+            });
+
+          const allMatches = [...new Set([...matches, ...leafMatches])];
+          console.log(`[IHM Audit] Process poll attempt ${attempts}: found ${allMatches.length} matching items`, allMatches.map(el => el.textContent.trim()));
+
+          if (allMatches.length === 0 && attempts === 3) {
+            // Log body children to find where the portal is rendering
+            const bodyChildren = Array.from(document.body.children).map(el =>
+              `${el.tagName}#${el.id}.${el.className.toString().split(' ')[0]}`
+            );
+            console.log('[IHM Audit] Body children:', bodyChildren);
+            // Log all li elements anywhere in document
+            const allLi = Array.from(document.querySelectorAll('li'))
+              .map(el => el.textContent.trim()).filter(t => t && t.length < 80).slice(0, 30);
+            console.log('[IHM Audit] All li elements:', allLi);
+            // Log all button texts to see what's in the dropdown
+            const allBtns = Array.from(document.querySelectorAll('button'))
+              .map(b => b.textContent.trim()).filter(t => t && t.length < 60);
+            console.log('[IHM Audit] All button texts:', allBtns);
+          }
+
+          if (allMatches.length > 0) {
+            clearInterval(poll);
+
+            // Deduplicate — each process name should only be clicked ONCE
+            const seen = new Set();
+            const uniqueMatches = allMatches.filter(el => {
+              const text = el.textContent.trim();
+              if (seen.has(text)) return false;
+              seen.add(text);
+              return true;
+            });
+            console.log('[IHM Audit] Unique items to click:', uniqueMatches.map(el => el.textContent.trim()));
+
+            let idx = 0;
+            function clickNext() {
+              if (idx >= uniqueMatches.length) {
+                console.log('[IHM Audit] All processes clicked');
+                setTimeout(() => {
+                  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+                  setTimeout(() => {
+                    const filterBtn = findButtonByText('filter');
+                    if (filterBtn) { filterBtn.click(); console.log('[IHM Audit] Clicked Filter'); }
+                  }, 400);
+                }, 300);
+                return;
+              }
+              const el = uniqueMatches[idx];
+              // The element IS a button — click it directly
+              const btn = el.tagName === 'BUTTON' ? el : (el.closest('button') || el.closest('li, [role="option"]') || el);
+              btn.scrollIntoView({ block: 'nearest' });
+              console.log('[IHM Audit] Clicking:', el.textContent.trim(), '| tag:', btn.tagName);
+              btn.click();
+              idx++;
+              setTimeout(clickNext, 300);
+            }
+            clickNext();
+
+          } else if (attempts >= 15) {
+            clearInterval(poll);
+            console.warn('[IHM Audit] Process items not found after 15 attempts — clicking Filter anyway');
+            // Log what list items exist for debugging
+            const allLi = Array.from(document.querySelectorAll('li, [role="option"]'))
+              .map(el => el.textContent.trim()).filter(t => t && t.length < 60).slice(0, 20);
+            console.log('[IHM Audit] Visible list items:', allLi);
+            const filterBtn = findButtonByText('filter');
+            if (filterBtn) filterBtn.click();
+          }
+        }, 300);
+      }
+
+      // Guard: only run process selection once
+      if (window._ihmProcessDone) {
+        console.log('[IHM Audit] Process selection already done, skipping');
+        return;
+      }
+      window._ihmProcessDone = true;
+
+      selectProcessesThenFilter();
+    }
+
+    // -------------------------------------------------------------------------
+    // Banner CSS
+    // -------------------------------------------------------------------------
+
+    GM_addStyle(`
+      #ihm-autofill-banner {
+        position: fixed; top: 12px; right: 12px; z-index: 999999;
+        background: #0073bb; color: #fff; padding: 8px 14px;
+        border-radius: 6px; font-size: 13px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.2); pointer-events: none;
+      }
+    `);
+
+    const banner = document.createElement('div');
+    banner.id = 'ihm-autofill-banner';
+    banner.textContent = `Auto-filling filters for ASIN: ${asin}…`;
+    document.body.appendChild(banner);
+    setTimeout(() => banner.remove(), 4000);
+
+    // -------------------------------------------------------------------------
+    // Wait for form to render, then auto-fill
+    // -------------------------------------------------------------------------
+
+    function isFormReady() {
+      const hasDateInput = document.querySelector('input[type="text"]');
+      const hasFilterBtn = findButtonByText('filter');
+      // Check processes have loaded by looking for the Select All checkbox or any process chip
+      const hasProcesses = (() => {
+        // Method 1: Select all checkbox present
+        const allEls = document.querySelectorAll('span, div, p, label');
+        for (const el of allEls) {
+          if (el.children.length === 0 && el.textContent.trim().toLowerCase() === 'select all') return true;
+        }
+        // Method 2: process dropdown shows a count like "102 selected" or "7 selected"
+        const dropdownText = document.querySelector('[class*="process"] [class*="select"], [class*="process"] select');
+        if (dropdownText && dropdownText.textContent.includes('selected')) return true;
+        // Method 3: any element with "Select Process" placeholder (means dropdown rendered)
+        const processSelect = document.querySelector('[data-testid="select-all-check-box"]');
+        if (processSelect) return true;
+        return false;
+      })();
+
+      console.log('[IHM Audit] isFormReady — dateInput:', !!hasDateInput, 'filterBtn:', !!hasFilterBtn, 'processes:', hasProcesses);
+      return hasDateInput && hasFilterBtn && hasProcesses;
+    }
+
+    // Strategy: fill once when form is ready, then fill again after the process
+    // list API completes (which resets the form ~1-2s after page load).
+    // We schedule fills at 1s, 2s, and 3s after the form first becomes ready
+    // to ensure at least one fill lands after the API reset.
+    let fillCount = 0;
+
+    function scheduleFills() {
+      // Fill dates/ASIN at 1s and 2s to survive the process list API reset
+      [1000, 2000].forEach(delay => {
+        setTimeout(() => {
+          if (isFormReady()) {
+            console.log(`[IHM Audit] Filling dates/ASIN at +${delay}ms`);
+            autoFillDatesAndAsin();
+          }
+        }, delay);
+      });
+      // Process selection runs ONCE at 3s — hard flag prevents re-runs
+      setTimeout(() => {
+        if (isFormReady()) {
+          console.log('[IHM Audit] Running process selection at +3000ms');
+          autoFill();
+        }
+      }, 3000);
+    }
+
+    if (isFormReady()) {
+      scheduleFills();
+      return;
+    }
+
+    const tid = setTimeout(() => {
+      obs.disconnect();
+      console.warn('[IHM Audit Auto-Fill] Form not found after 10s.');
+    }, 10000);
+
+    const obs = new MutationObserver(() => {
+      if (isFormReady()) {
+        obs.disconnect();
+        clearTimeout(tid);
+        scheduleFills();
+      }
+    });
+    obs.observe(document.body, { childList: true, subtree: true });
+
+    // -------------------------------------------------------------------------
+    // Scrape ReceiveV3_Stow results and send back to reconcile page via localStorage
+    // -------------------------------------------------------------------------
+
+    /**
+     * Waits for the results table to populate after Filter is clicked,
+     * then scrapes rows where Process = "ReceiveV3_Stow" and stores
+     * { location, quantity } in localStorage keyed by ASIN.
+     */
+    function scrapeStowResults() {
+      const table = document.querySelector('table');
+      if (!table) return null;
+
+      const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim().toLowerCase());
+      const asinIdx = headers.findIndex(h => h.includes('asin'));
+      const locationIdx = headers.findIndex(h => h.includes('location'));
+      const qtyIdx = headers.findIndex(h => h === 'quantity' || h.includes('quantity'));
+      const processIdx = headers.findIndex(h => h.includes('process'));
+
+      if (asinIdx === -1 || locationIdx === -1 || processIdx === -1) {
+        console.log('[IHM Audit] Could not find required columns. Headers:', headers);
+        return null;
+      }
+
+      const stowRows = [];
+      table.querySelectorAll('tbody tr').forEach(row => {
+        const cells = Array.from(row.querySelectorAll('td'));
+        if (!cells.length) return;
+        const process = cells[processIdx] ? cells[processIdx].textContent.trim() : '';
+        if (process !== 'ReceiveV3_Stow') return;
+        const location = cells[locationIdx] ? cells[locationIdx].textContent.trim() : '';
+        const quantity = cells[qtyIdx] ? cells[qtyIdx].textContent.trim() : '';
+        stowRows.push({ location, quantity });
+      });
+
+      return stowRows;
+    }
+
+    function waitForResultsAndScrape() {
+      let attempts = 0;
+      const maxAttempts = 20;
+
+        const checkInterval = setInterval(() => {
+          attempts++;
+          const table = document.querySelector('table tbody tr td');
+          const noData = document.querySelector('[class*="no-data"], [class*="empty"]');
+
+          if (noData || attempts >= maxAttempts) {
+            clearInterval(checkInterval);
+            if (noData) console.log('[IHM Audit] No data found for this ASIN/filter combination.');
+            return;
+          }
+
+          if (table) {
+            clearInterval(checkInterval);
+
+            // Scrape all pages by clicking Next until done
+            function scrapeAllPages(allStowRows, callback) {
+              // Scrape current page
+              const pageData = scrapeStowResults();
+              if (pageData) allStowRows.push(...pageData);
+              console.log('[IHM Audit] Scraped page, total rows so far:', allStowRows.length);
+
+              // Check if there's a Next page button that's enabled
+              const nextBtn = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+                .find(el => {
+                  const text = el.textContent.trim().toLowerCase();
+                  const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                  return (text === '>' || text === 'next' || label.includes('next')) &&
+                         !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+                });
+
+              if (nextBtn) {
+                console.log('[IHM Audit] Clicking Next page');
+                nextBtn.click();
+                // Wait for next page to load
+                setTimeout(() => scrapeAllPages(allStowRows, callback), 1500);
+              } else {
+                console.log('[IHM Audit] No more pages, total rows:', allStowRows.length);
+                callback(allStowRows);
+              }
+            }
+
+            scrapeAllPages([], (allStowData) => {
+              if (allStowData.length > 0) {
+                console.log('[IHM Audit] Found ReceiveV3_Stow rows:', allStowData);
+                const storageKey = `ihm_stow_${asin}`;
+                localStorage.setItem(storageKey, JSON.stringify({
+                  asin,
+                  stowLocations: allStowData,
+                  timestamp: Date.now()
+                }));
+                console.log('[IHM Audit] Stored stow data in localStorage:', storageKey);
+                const banner = document.getElementById('ihm-autofill-banner');
+                if (banner) {
+                  banner.textContent = `Found ${allStowData.length} stow location${allStowData.length !== 1 ? 's' : ''} for ${asin} — data sent to Shortage Review panel.`;
+                  banner.style.background = '#2e7d32';
+                  setTimeout(() => banner.remove(), 5000);
+                }
+              } else {
+                console.log('[IHM Audit] No ReceiveV3_Stow rows found in results.');
+              }
+            });
+          }
+        }, 500);
+      }
+
+    // Schedule the results scrape after the last autoFill + filter click
+    // Give it 5 seconds after the last fill attempt to let results load
+    setTimeout(waitForResultsAndScrape, 5000);
+
+  } // end runAuditPage
+
+})(); // end IIFE
