@@ -7,6 +7,7 @@
 // @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page
 // @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page*
 // @grant        GM_addStyle
+// @grant        GM_openInTab
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -283,7 +284,7 @@
 
         const summary = document.createElement('p');
         summary.className = 'ihm-summary';
-        summary.textContent = `${shortages.length} item${shortages.length !== 1 ? 's' : ''} with unpacked units. Click "Open Audit →" to load stow locations — they'll appear automatically in the Stow Location column.`;
+        summary.textContent = `${shortages.length} item${shortages.length !== 1 ? 's' : ''} with unpacked units. Click "Open Audit →" to load stow locations — Stow locations are loading automatically in the background�`;
         body.appendChild(summary);
 
         const table = document.createElement('table');
@@ -399,6 +400,17 @@
             }
           }
         });
+
+        // Auto-open audit tabs for each shortage item, one at a time with a delay
+        function autoOpenAuditTabs(items, idx) {
+          if (idx >= items.length) return;
+          const item = items[idx];
+          const auditUrl = 'https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page#asin=' + encodeURIComponent(item.asin);
+          console.log('[IHM Transship] Auto-opening audit tab for:', item.asin);
+          GM_openInTab(auditUrl, { active: false, insert: true });
+          setTimeout(() => autoOpenAuditTabs(items, idx + 1), 3000);
+        }
+        autoOpenAuditTabs(shortages, 0);
       }
 
       return { show, hide, render, renderLoading };
