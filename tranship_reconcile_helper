@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         IHM Shortage Review
 // @namespace    https://grocerycentral.amazon.dev/
-// @version      3.1.0
+// @version      3.2.4
 // @description  Adds a Shortage Review button to the IHM transship page, and auto-fills filters on the Inventory Audit Dashboard when opened from that button
+// @match        https://grocerycentral.amazon.dev/ihm-transship-dashboards/inbound-manifest-view-v2/
 // @match        https://grocerycentral.amazon.dev/ihm-transship-dashboards/inbound-manifest-view-v2/*
 // @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page
 // @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page*
@@ -35,24 +36,21 @@
 
     function expandAllTotes() {
       return new Promise((resolve) => {
+        const doc = getDoc();
         let expandBtn = null;
 
-        // Try multiple strategies to find the Expand All button
-        // The button contains spans: one with "Expand" and one with "Collapse All"
-        // so textContent is "ExpandCollapse All" — search for just "Expand"
-        for (const el of document.querySelectorAll('button')) {
-          const text = el.textContent.trim().toLowerCase();
-          if (text.includes('expand') && text.includes('collapse')) {
+        for (const el of doc.querySelectorAll('button, a, span, [role="button"]')) {
+          const text = el.textContent.trim().toLowerCase().replace(/\s+/g, ' ');
+          if (text === 'expand all' || text.startsWith('expand all')) {
             expandBtn = el;
             break;
           }
         }
 
-        // Fallback: look for a button whose text starts with "expand"
         if (!expandBtn) {
-          for (const el of document.querySelectorAll('button, a, span')) {
+          for (const el of doc.querySelectorAll('button, a, span')) {
             const text = el.textContent.trim().toLowerCase();
-            if (text.startsWith('expand') && text.length < 30) {
+            if (text === 'expand all' || (text.includes('expand') && text.includes('collapse'))) {
               expandBtn = el;
               break;
             }
@@ -60,13 +58,12 @@
         }
 
         if (!expandBtn) {
-          console.log('[IHM Transship] Expand All button not found — totes may already be expanded or button has different text');
+          console.log('[IHM Transship] Expand All button not found — proceeding without expanding');
           resolve();
           return;
         }
 
-        console.log('[IHM Transship] Found Expand All button, clicking:', expandBtn.textContent.trim());
-        // Use full mouse event sequence in case it's an Ember component
+        console.log('[IHM Transship] Found Expand All button:', expandBtn.textContent.trim());
         expandBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
         expandBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
         expandBtn.click();
@@ -74,10 +71,10 @@
         let quietTimer = null;
         const obs = new MutationObserver(() => {
           clearTimeout(quietTimer);
-          quietTimer = setTimeout(() => { obs.disconnect(); resolve(); }, 400);
+          quietTimer = setTimeout(() => { obs.disconnect(); resolve(); }, 600);
         });
-        obs.observe(document.body, { childList: true, subtree: true });
-        setTimeout(() => { obs.disconnect(); clearTimeout(quietTimer); resolve(); }, 5000);
+        obs.observe(doc.body, { childList: true, subtree: true });
+        setTimeout(() => { obs.disconnect(); clearTimeout(quietTimer); resolve(); }, 6000);
       });
     }
 
@@ -86,10 +83,11 @@
     // -------------------------------------------------------------------------
 
     function scrapeShortages() {
+      const doc = getDoc();
       const shortages = [];
       const asinPattern = /^[A-Z0-9]{10}$/i;
 
-      document.querySelectorAll('tr').forEach((row) => {
+      doc.querySelectorAll('tr').forEach((row) => {
         const cells = Array.from(row.querySelectorAll('td'));
         if (cells.length < 4) return;
 
@@ -420,37 +418,50 @@
     // Wait for Reconcile button
     // -------------------------------------------------------------------------
 
+    // Helper: always use the top-level document — the iframe is just a Boomerang analytics script
+    function getDoc() {
+      return document;
+    }
+
     function waitForReconcileButton(callback) {
       function find() {
-        const byAction = document.querySelector('button[data-action="reconcile"]');
-        if (byAction) return byAction;
-        const byTestId = document.querySelector('button[data-testid*="reconcile"],button[data-testid*="Reconcile"]');
-        if (byTestId) return byTestId;
-        for (const btn of document.querySelectorAll('button')) {
-          const t = btn.textContent.trim().toLowerCase();
-          if (t === 'reconcile ts' || t === 'reconcile' || t.startsWith('reconcile')) return btn;
+        const doc = getDoc();
+
+        // Search for Reconcile TS button in the active document
+        for (const el of doc.querySelectorAll('button, a, [role="button"], [role="menuitem"]')) {
+          const t = el.textContent.trim().toLowerCase().replace(/\s+/g, ' ');
+          if (t.includes('reconcile')) return el;
         }
-        for (const el of document.querySelectorAll('a, [role="button"]')) {
-          const t = el.textContent.trim().toLowerCase();
-          if (t.startsWith('reconcile')) return el;
+
+        // Last resort: any element whose exact text is "Reconcile TS" or "Download CSV"
+        for (const el of doc.querySelectorAll('*')) {
+          const t = el.textContent.trim();
+          if (t === 'Reconcile TS' || t === 'Download CSV') return el;
         }
-        console.log('[IHM Transship] Buttons found:', Array.from(document.querySelectorAll('button')).map(b => b.textContent.trim()).filter(t => t).slice(0, 15));
+
+        const allBtns = Array.from(doc.querySelectorAll('button, [role="button"], a'))
+          .map(b => b.textContent.trim()).filter(t => t).slice(0, 20);
+        console.log('[IHM Transship] Clickable elements found:', allBtns.length, allBtns);
         return null;
       }
 
-      const existing = find();
-      if (existing) { callback(existing); return; }
-
-      const tid = setTimeout(() => {
-        obs.disconnect();
-        console.warn('[IHM Shortage Review] Reconcile button not found after 10s.');
-      }, 10000);
-
-      const obs = new MutationObserver(() => {
+      // Poll every 500ms for up to 30 seconds waiting for iframe content + button
+      let attempts = 0;
+      const maxAttempts = 60;
+      const interval = setInterval(function () {
+        attempts++;
         const btn = find();
-        if (btn) { obs.disconnect(); clearTimeout(tid); callback(btn); }
-      });
-      obs.observe(document.body, { childList: true, subtree: true });
+        if (btn) {
+          clearInterval(interval);
+          console.log('[IHM Shortage Review] Found anchor button:', btn.textContent.trim());
+          callback(btn);
+          return;
+        }
+        if (attempts >= maxAttempts) {
+          clearInterval(interval);
+          console.warn('[IHM Shortage Review] Reconcile/anchor button not found after 30s. Doc used:', getDoc() === document ? 'top' : 'iframe');
+        }
+      }, 500);
     }
 
     // -------------------------------------------------------------------------
@@ -677,7 +688,7 @@
           triggerDropdownOpen(trigger);
           console.log('[IHM Audit] Opened process dropdown, trigger text:', trigger.textContent.trim());
         } else {
-          console.warn('[IHM Audit] Process dropdown trigger not found — all button texts:',
+          console.warn('[IHM Audit] Process dropdown trigger not found — all button texts:', 
             Array.from(document.querySelectorAll('button')).map(b => b.textContent.trim()).filter(t => t).slice(0, 15));
           // Click Filter anyway with whatever processes are selected
           const filterBtn = findButtonByText('filter');
@@ -713,7 +724,7 @@
 
           if (allMatches.length === 0 && attempts === 3) {
             // Log body children to find where the portal is rendering
-            const bodyChildren = Array.from(document.body.children).map(el =>
+            const bodyChildren = Array.from(document.body.children).map(el => 
               `${el.tagName}#${el.id}.${el.className.toString().split(' ')[0]}`
             );
             console.log('[IHM Audit] Body children:', bodyChildren);
