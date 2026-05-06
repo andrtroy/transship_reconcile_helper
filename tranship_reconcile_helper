@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         IHM Shortage Review
+// @name         Transship Shortage Helper
 // @namespace    https://grocerycentral.amazon.dev/
 // @version      3.2.4
 // @description  Adds a Shortage Review button to the IHM transship page, and auto-fills filters on the Inventory Audit Dashboard when opened from that button
@@ -8,7 +8,6 @@
 // @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page
 // @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page*
 // @grant        GM_addStyle
-// @grant        GM_openInTab
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -282,7 +281,7 @@
 
         const summary = document.createElement('p');
         summary.className = 'ihm-summary';
-        summary.textContent = `${shortages.length} item${shortages.length !== 1 ? 's' : ''} with unpacked units. Click "Open Audit →" to load stow locations — Stow locations are loading automatically in the background�`;
+        summary.textContent = `${shortages.length} item${shortages.length !== 1 ? 's' : ''} with unpacked units. Click "Open Audit →" to load stow locations.`;
         body.appendChild(summary);
 
         const table = document.createElement('table');
@@ -398,17 +397,6 @@
             }
           }
         });
-
-        // Auto-open audit tabs for each shortage item, one at a time with a delay
-        function autoOpenAuditTabs(items, idx) {
-          if (idx >= items.length) return;
-          const item = items[idx];
-          const auditUrl = 'https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page#asin=' + encodeURIComponent(item.asin);
-          console.log('[IHM Transship] Auto-opening audit tab for:', item.asin);
-          GM_openInTab(auditUrl, { active: false, insert: true });
-          setTimeout(() => autoOpenAuditTabs(items, idx + 1), 3000);
-        }
-        autoOpenAuditTabs(shortages, 0);
       }
 
       return { show, hide, render, renderLoading };
@@ -688,7 +676,7 @@
           triggerDropdownOpen(trigger);
           console.log('[IHM Audit] Opened process dropdown, trigger text:', trigger.textContent.trim());
         } else {
-          console.warn('[IHM Audit] Process dropdown trigger not found — all button texts:', 
+          console.warn('[IHM Audit] Process dropdown trigger not found — all button texts:',
             Array.from(document.querySelectorAll('button')).map(b => b.textContent.trim()).filter(t => t).slice(0, 15));
           // Click Filter anyway with whatever processes are selected
           const filterBtn = findButtonByText('filter');
@@ -724,7 +712,7 @@
 
           if (allMatches.length === 0 && attempts === 3) {
             // Log body children to find where the portal is rendering
-            const bodyChildren = Array.from(document.body.children).map(el => 
+            const bodyChildren = Array.from(document.body.children).map(el =>
               `${el.tagName}#${el.id}.${el.className.toString().split(' ')[0]}`
             );
             console.log('[IHM Audit] Body children:', bodyChildren);
