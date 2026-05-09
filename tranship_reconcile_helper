@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Transship Shortage Helper
 // @namespace    https://grocerycentral.amazon.dev/
-// @version      3.2.4
+// @version      3.3.2
 // @description  Adds a Shortage Review button to the IHM transship page, and auto-fills filters on the Inventory Audit Dashboard when opened from that button
 // @match        https://grocerycentral.amazon.dev/ihm-transship-dashboards/inbound-manifest-view-v2/
 // @match        https://grocerycentral.amazon.dev/ihm-transship-dashboards/inbound-manifest-view-v2/*
@@ -28,6 +28,85 @@
   // ===========================================================================
 
   function runTransshipPage() {
+
+    // -------------------------------------------------------------------------
+    // Clear stale stow location data from previous transships
+    // -------------------------------------------------------------------------
+
+    (function clearStaleStowData() {
+      const keysToRemove = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith('ihm_stow_')) {
+          keysToRemove.push(key);
+        }
+      }
+      if (keysToRemove.length > 0) {
+        keysToRemove.forEach(k => localStorage.removeItem(k));
+        console.log(`[IHM Transship] Cleared ${keysToRemove.length} stale stow location entries from localStorage`);
+      }
+    })();
+
+    // -------------------------------------------------------------------------
+    // Scrape Activation Time from the transship page header
+    // -------------------------------------------------------------------------
+
+    function scrapeActivationTime() {
+      const doc = getDoc();
+      // Look for "Activation Time" label and grab the adjacent value
+      const allEls = doc.querySelectorAll('span, div, p, td, dt, dd, label, strong, b');
+      for (const el of allEls) {
+        const text = el.textContent.trim().toLowerCase();
+        if (text === 'activation time' || text === 'activation time:') {
+          // The value is likely in the next sibling or a child element
+          const parent = el.parentElement;
+          if (parent) {
+            const siblings = Array.from(parent.children);
+            const idx = siblings.indexOf(el);
+            // Check next sibling element
+            if (idx >= 0 && idx < siblings.length - 1) {
+              const val = siblings[idx + 1].textContent.trim();
+              if (val && /\d/.test(val)) return val;
+            }
+            // Check parent's next sibling
+            const parentNext = parent.nextElementSibling;
+            if (parentNext) {
+              const val = parentNext.textContent.trim();
+              if (val && /\d/.test(val)) return val;
+            }
+          }
+          // Try nextSibling text node
+          let next = el.nextSibling;
+          while (next) {
+            const val = (next.textContent || '').trim();
+            if (val && /\d/.test(val)) return val;
+            next = next.nextSibling;
+          }
+          // Try next element sibling
+          const nextEl = el.nextElementSibling;
+          if (nextEl) {
+            const val = nextEl.textContent.trim();
+            if (val && /\d/.test(val)) return val;
+          }
+        }
+      }
+
+      // Fallback: look for elements containing a date pattern near "Activation"
+      for (const el of allEls) {
+        const text = el.textContent.trim();
+        // Match patterns like "5/8/2026, 7:08:21 PM" or "05/08/2026, 19:08:21"
+        if (/\d{1,2}\/\d{1,2}\/\d{4},?\s+\d{1,2}:\d{2}/.test(text) && text.length < 40) {
+          // Check if a nearby element says "Activation"
+          const parent = el.parentElement;
+          if (parent && parent.textContent.toLowerCase().includes('activation')) {
+            return text;
+          }
+        }
+      }
+
+      console.warn('[IHM Transship] Activation Time not found on page');
+      return null;
+    }
 
     // -------------------------------------------------------------------------
     // Expand all totes, wait for DOM to settle
@@ -281,7 +360,7 @@
 
         const summary = document.createElement('p');
         summary.className = 'ihm-summary';
-        summary.textContent = `${shortages.length} item${shortages.length !== 1 ? 's' : ''} with unpacked units. Click "Open Audit →" to load stow locations.`;
+        summary.textContent = `${shortages.length} item${shortages.length !== 1 ? 's' : ''} with units not yet received. Click "Open Audit →" to load stow locations.`;
         body.appendChild(summary);
 
         const table = document.createElement('table');
@@ -289,7 +368,7 @@
 
         const thead = document.createElement('thead');
         const hRow = document.createElement('tr');
-        ['ASIN', 'Title', 'Expected', 'Unpacked', 'Tote', 'Stow Location', 'Audit Dashboard'].forEach(text => {
+        ['ASIN', 'Title', 'Expected', 'Received', 'Not Yet Received', 'Tote', 'Stow Location', 'Audit Dashboard'].forEach(text => {
           const th = document.createElement('th');
           th.textContent = text;
           hRow.appendChild(th);
@@ -313,13 +392,19 @@
           tr.appendChild(tdTitle);
 
           const tdExp = document.createElement('td');
+          tdExp.style.cssText = 'color:#000;font-weight:500';
           tdExp.textContent = item.expectedQty;
           tr.appendChild(tdExp);
 
-          const tdUnpacked = document.createElement('td');
-          tdUnpacked.className = 'ihm-qty-short';
-          tdUnpacked.textContent = item.unpackedQty;
-          tr.appendChild(tdUnpacked);
+          const tdReceived = document.createElement('td');
+          tdReceived.style.cssText = 'color:#1b5e20;font-weight:700';
+          tdReceived.textContent = item.unpackedQty;
+          tr.appendChild(tdReceived);
+
+          const tdNotReceived = document.createElement('td');
+          tdNotReceived.style.cssText = 'color:#b71c1c;font-weight:700;font-style:italic';
+          tdNotReceived.textContent = item.expectedQty - item.unpackedQty;
+          tr.appendChild(tdNotReceived);
 
           const tdTote = document.createElement('td');
           tdTote.textContent = item.toteId || '—';
@@ -357,7 +442,11 @@
           tr.appendChild(tdStow);
 
           const tdLink = document.createElement('td');
-          const auditUrl = `https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page#asin=${encodeURIComponent(item.asin)}`;
+          let auditUrl = `https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page#asin=${encodeURIComponent(item.asin)}`;
+          const activationTime = scrapeActivationTime();
+          if (activationTime) {
+            auditUrl += `&activationTime=${encodeURIComponent(activationTime)}`;
+          }
           const link = document.createElement('a');
           link.href = auditUrl;
           link.target = '_blank';
@@ -502,6 +591,33 @@
     if (!asin) return; // Not opened from shortage review — do nothing
 
     // -------------------------------------------------------------------------
+    // Parse activation time from URL hash
+    // -------------------------------------------------------------------------
+
+    function getActivationTimeFromHash() {
+      const hash = window.location.hash;
+      const match = /[#&]activationTime=([^&]+)/.exec(hash);
+      if (!match) return null;
+      const raw = decodeURIComponent(match[1]).trim();
+      // Try to parse the activation time string (e.g., "5/8/2026, 7:08:21 PM")
+      const parsed = new Date(raw);
+      if (!isNaN(parsed.getTime())) return parsed;
+      // Fallback: try manual parsing for "M/D/YYYY, H:MM:SS AM/PM" format
+      const parts = /(\d{1,2})\/(\d{1,2})\/(\d{4}),?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i.exec(raw);
+      if (parts) {
+        let [, month, day, year, hours, minutes, , ampm] = parts;
+        hours = parseInt(hours, 10);
+        if (ampm) {
+          if (ampm.toUpperCase() === 'PM' && hours !== 12) hours += 12;
+          if (ampm.toUpperCase() === 'AM' && hours === 12) hours = 0;
+        }
+        return new Date(parseInt(year, 10), parseInt(month, 10) - 1, parseInt(day, 10), hours, parseInt(minutes, 10));
+      }
+      console.warn('[IHM Audit] Could not parse activation time:', raw);
+      return null;
+    }
+
+    // -------------------------------------------------------------------------
     // Date helpers
     // -------------------------------------------------------------------------
 
@@ -513,9 +629,20 @@
 
     function getDateRange() {
       const now = new Date();
-      const from = new Date(now);
-      from.setDate(from.getDate() - 3);
-      return { fromDate: formatDate(from), fromTime: '00:00', toDate: formatDate(now), toTime: '23:59' };
+      const activationDate = getActivationTimeFromHash();
+      let from;
+      if (activationDate) {
+        // Round down to the start of the hour
+        from = new Date(activationDate);
+        from.setMinutes(0, 0, 0);
+        console.log('[IHM Audit] Using activation time (rounded to hour):', from.toString());
+      } else {
+        // Fallback: t-3 days if activation time not available
+        from = new Date(now);
+        from.setDate(from.getDate() - 3);
+        console.log('[IHM Audit] Activation time not found, falling back to t-3 days');
+      }
+      return { fromDate: formatDate(from), fromTime: `${String(from.getHours()).padStart(2, '0')}:${String(from.getMinutes()).padStart(2, '0')}`, toDate: formatDate(now), toTime: '23:59' };
     }
 
     // -------------------------------------------------------------------------
