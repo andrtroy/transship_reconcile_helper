@@ -1,18 +1,67 @@
 // ==UserScript==
-// @name         Transship Shortage Helper
+// @name         Transship Shortage Helper 
 // @namespace    https://grocerycentral.amazon.dev/
-// @version      3.3.2
-// @description  Adds a Shortage Review button to the IHM transship page, and auto-fills filters on the Inventory Audit Dashboard when opened from that button
+// @version      3.4.1
+// @description  Adds a Shortage Review button to the IHM transship page, auto-fills filters on the Inventory Audit Dashboard, and links to Associate Tools Receive v3 Stow
 // @match        https://grocerycentral.amazon.dev/ihm-transship-dashboards/inbound-manifest-view-v2/
 // @match        https://grocerycentral.amazon.dev/ihm-transship-dashboards/inbound-manifest-view-v2/*
 // @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page
 // @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page*
+// @match        https://ui.us-west-2.prod.associatetools.ihm.amazon.dev/*
 // @grant        GM_addStyle
 // @run-at       document-idle
 // ==/UserScript==
 
 (function () {
   'use strict';
+
+  // ---------------------------------------------------------------------------
+  // Site code mapping (shared across all pages)
+  // ---------------------------------------------------------------------------
+
+  const SITE_CODE_MAP = {
+    'UAZ1': 'US-AZ-19', 'UCA4': 'US-CA-175', 'UCA5': 'US-CA-173',
+    'UCO1': 'US-CO-33', 'UFL4': 'US-FL-51', 'UFL5': 'US-FL-52',
+    'UFL6': 'US-FL-53', 'UGA2': 'US-GA-21', 'UGA4': 'US-GA-22',
+    'UIL1': 'US-IL-72', 'UIL2': 'US-IL-71', 'UIN1': 'US-IN-7',
+    'ULA6': 'US-CA-142', 'UMA4': 'US-MA-45', 'UMD1': 'US-MD-17',
+    'UMN1': 'US-MN-11', 'UNC2': 'US-NC-24', 'UNC3': 'US-NC-23',
+    'UNJ1': 'US-NJ-40', 'UNJ2': 'US-NJ-48', 'UNV3': 'US-NV-10',
+    'UNY2': 'US-NY-72', 'UNY4': 'US-NY-61', 'UNY5': 'US-NY-73',
+    'UOH4': 'US-OH-15', 'UOH5': 'US-OH-14', 'UOR2': 'US-OR-11',
+    'UPA1': 'US-PA-23', 'USC1': 'US-CA-172', 'USD1': 'US-CA-169',
+    'USF1': 'US-CA-170', 'USF2': 'US-CA-171', 'USF4': 'US-CA-178',
+    'UTN1': 'US-TN-12', 'UTX3': 'US-TX-58', 'UTX4': 'US-TX-60',
+    'UTX7': 'US-TX-61', 'UTX8': 'US-TX-57', 'UTX9': 'US-TX-59',
+    'UVA1': 'US-VA-26', 'UVA4': 'US-VA-25', 'UVA5': 'US-VA-24',
+    'UWA1': 'US-WA-29', 'UWA2': 'US-WA-931', 'UWA6': 'US-WA-932',
+    'UWI2': 'US-WI-6', 'JFK2': 'US-NY-63'
+  };
+
+  function getCurrentStoreId() {
+    try {
+      // Read from page text — look for "Houdini FC: UNC2" or similar pattern
+      const pageText = document.body ? document.body.innerText : '';
+      const siteKeys = Object.keys(SITE_CODE_MAP);
+      for (const key of siteKeys) {
+        if (pageText.includes(key)) return SITE_CODE_MAP[key];
+      }
+      // Fallback: check localStorage ACTIVE_SITE (set by Store Management pages)
+      const activeSiteData = localStorage.getItem('ACTIVE_SITE');
+      if (activeSiteData) {
+        const parsed = JSON.parse(activeSiteData);
+        const fcId = parsed.fcId || parsed.storeAcronym || '';
+        if (fcId && SITE_CODE_MAP[fcId]) return SITE_CODE_MAP[fcId];
+      }
+    } catch (e) {}
+    return 'US-NC-24';
+  }
+
+  function generateReceiveStowUrl(asin) {
+    const storeId = getCurrentStoreId();
+    const base = 'https://ui.us-west-2.prod.associatetools.ihm.amazon.dev/remote/ihm-associate-tools-base/index.html';
+    return `${base}?auth=midway&domain=prod&region=iad&storeId=${storeId}&shortage-receive-asin=${encodeURIComponent(asin)}#/home`;
+  }
 
   const url = window.location.href;
 
@@ -21,6 +70,8 @@
     runTransshipPage();
   } else if (url.includes('/inventory-audit-main-page')) {
     runAuditPage();
+  } else if (url.includes('ui.us-west-2.prod.associatetools.ihm.amazon.dev') && url.includes('shortage-receive-asin')) {
+    runReceiveStowPage();
   }
 
   // ===========================================================================
@@ -368,7 +419,7 @@
 
         const thead = document.createElement('thead');
         const hRow = document.createElement('tr');
-        ['ASIN', 'Title', 'Expected', 'Received', 'Not Yet Received', 'Tote', 'Stow Location', 'Audit Dashboard'].forEach(text => {
+        ['ASIN', 'Title', 'Expected', 'Received', 'Not Yet Received', 'Tote', 'Stow Location', 'Audit Dashboard', 'Receive'].forEach(text => {
           const th = document.createElement('th');
           th.textContent = text;
           hRow.appendChild(th);
@@ -455,6 +506,18 @@
           link.textContent = 'Open Audit →';
           tdLink.appendChild(link);
           tr.appendChild(tdLink);
+
+          // Receive column — link to Associate Tools Receive v3 Stow
+          const tdReceive = document.createElement('td');
+          const receiveLink = document.createElement('a');
+          receiveLink.href = generateReceiveStowUrl(item.asin);
+          receiveLink.target = '_blank';
+          receiveLink.rel = 'noopener noreferrer';
+          receiveLink.className = 'ihm-audit-link';
+          receiveLink.style.color = '#0d9488';
+          receiveLink.textContent = 'Receive →';
+          tdReceive.appendChild(receiveLink);
+          tr.appendChild(tdReceive);
 
           tbody.appendChild(tr);
         });
@@ -1116,5 +1179,243 @@
     setTimeout(waitForResultsAndScrape, 5000);
 
   } // end runAuditPage
+
+  // ===========================================================================
+  // ASSOCIATE TOOLS — Receive v3 → Stow → Auto-fill ASIN
+  // ===========================================================================
+
+  function runReceiveStowPage() {
+    // Extract ASIN from URL query param (check both own URL and parent URL)
+    let search = window.location.search || '';
+    // If we're in an iframe, the params might be in our own URL (passed through by parent)
+    const receiveAsinMatch = search.match(/shortage-receive-asin=([^&]*)/);
+    if (!receiveAsinMatch || !receiveAsinMatch[1]) return;
+
+    const receiveAsin = decodeURIComponent(receiveAsinMatch[1]).trim();
+    if (!receiveAsin) return;
+
+    const isInIframe = (window.self !== window.top);
+    console.log('[Shortage Helper] Receive Stow page: ASIN =', receiveAsin, isInIframe ? '(iframe)' : '(parent)');
+
+    // Only run from the parent page
+    if (isInIframe) return;
+
+    // Step 1: Click "Receive" (ihm_inbound_tool) in the sidebar
+    function clickReceiveV3() {
+      // The actual tool row is "sideBar-ihm_inbound_tool" (contains "Receive v3" text).
+      // Note: "sideBar-Receive" is just the CATEGORY HEADER that expands the section —
+      // we must NOT treat clicking it as success.
+      var sidebarItem = document.querySelector('tr[data-atb-id="sideBar-ihm_inbound_tool"]');
+
+      if (sidebarItem) {
+        console.log('[Shortage Helper] Found Receive tool sidebar item: sideBar-ihm_inbound_tool');
+        sidebarItem.click();
+        setTimeout(waitForStowAndClick, 2500);
+        return true;
+      }
+
+      // If the tool row isn't visible yet, try expanding the "Receive" category first
+      var categoryRow = document.querySelector('tr[data-atb-id="sideBar-Receive"]');
+      if (categoryRow) {
+        console.log('[Shortage Helper] Expanding Receive category to reveal ihm_inbound_tool');
+        categoryRow.click();
+        // Don't return true — we haven't clicked the actual tool yet
+        return false;
+      }
+
+      return false;
+    }
+
+    // Poll for sidebar to appear (same pattern as hot pick script)
+    let sidebarAttempts = 0;
+    let clickedReceive = false;
+    const sidebarInterval = setInterval(() => {
+      sidebarAttempts++;
+      if (sidebarAttempts % 5 === 0) {
+        const allTrs = document.querySelectorAll('tr[data-atb-id]');
+        const ids = Array.from(allTrs).map(tr => tr.getAttribute('data-atb-id'));
+        console.log('[Shortage Helper] Sidebar poll attempt', sidebarAttempts, '- found', allTrs.length, 'items:', ids);
+      }
+
+      if (!clickedReceive) {
+        clickedReceive = clickReceiveV3();
+      }
+
+      // If we already clicked but it didn't navigate, retry after a delay
+      if (clickedReceive && sidebarAttempts > 10 && sidebarAttempts % 5 === 0) {
+        const hasReceiveContent = document.querySelector('[data-atb-id*="stow"], [data-atb-id*="Stow"]') ||
+          Array.from(document.querySelectorAll('a, button, div, span')).some(el => el.textContent.trim() === 'Stow' && el.offsetParent !== null);
+        if (!hasReceiveContent) {
+          console.log('[Shortage Helper] Receive page not loaded yet, retrying click...');
+          clickedReceive = false; // Allow retry
+        }
+      }
+
+      if (sidebarAttempts >= 40) {
+        clearInterval(sidebarInterval);
+        if (!clickedReceive) {
+          console.warn('[Shortage Helper] Receive v3 sidebar not found after 20s');
+        } else {
+          console.log('[Shortage Helper] Sidebar timeout reached, attempting Stow search anyway');
+          waitForStowAndClick();
+        }
+      }
+    }, 500);
+
+    // Step 2: Click "Stow" on the Receive v3 page
+    function waitForStowAndClick() {
+      let attempts = 0;
+      const interval = setInterval(() => {
+        attempts++;
+
+        // Log what's visible on the page periodically for debugging
+        if (attempts === 5 || attempts === 15) {
+          const visibleTexts = Array.from(document.querySelectorAll('a, button, div[role="button"], span[role="button"], li, td'))
+            .filter(el => el.offsetParent !== null && el.textContent.trim().length < 30 && el.textContent.trim().length > 0)
+            .map(el => `${el.tagName}[${el.className?.split(' ')[0] || ''}]: "${el.textContent.trim()}"`)
+            .slice(0, 30);
+          console.log('[Shortage Helper] Visible clickable elements (attempt ' + attempts + '):', visibleTexts);
+        }
+
+        // Search in parent document — match "Stow" case-insensitively and also partial matches
+        let found = false;
+        const allEls = document.querySelectorAll('a, button, div, span, tr, td, li, [role="tab"], [role="button"], [role="menuitem"]');
+        for (const el of allEls) {
+          const text = el.textContent.trim();
+          // Match exact "Stow" or "STOW" or elements where the direct text (not children) is "Stow"
+          if (/^stow$/i.test(text) && el.offsetParent !== null) {
+            clearInterval(interval);
+            el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1 }));
+            el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerId: 1 }));
+            el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+            el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            console.log('[Shortage Helper] Clicked Stow (parent):', el.tagName, el.className);
+            setTimeout(waitForAsinInputAndFill, 2000);
+            found = true;
+            return;
+          }
+        }
+
+        // Search inside iframes
+        if (!found) {
+          const iframes = document.querySelectorAll('iframe');
+          for (const iframe of iframes) {
+            try {
+              const iDoc = iframe.contentDocument;
+              if (!iDoc) continue;
+              const iEls = iDoc.querySelectorAll('a, button, div, span, tr, td, li, [role="tab"], [role="button"], [role="menuitem"]');
+              for (const el of iEls) {
+                const text = el.textContent.trim();
+                if (/^stow$/i.test(text) && el.offsetParent !== null) {
+                  clearInterval(interval);
+                  el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1 }));
+                  el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerId: 1 }));
+                  el.click();
+                  console.log('[Shortage Helper] Clicked Stow (iframe):', el.tagName, el.className);
+                  setTimeout(waitForAsinInputAndFill, 2000);
+                  return;
+                }
+              }
+            } catch (e) {
+              // Cross-origin iframe — can't access
+              if (attempts === 5) console.log('[Shortage Helper] Cross-origin iframe detected:', iframe.src?.substring(0, 80));
+            }
+          }
+        }
+
+        if (attempts >= 30) {
+          clearInterval(interval);
+          console.warn('[Shortage Helper] Stow option not found after 15s');
+          // Last resort: skip Stow click and try to find the ASIN input directly
+          // (maybe the page already shows the stow input without needing to click "Stow")
+          console.log('[Shortage Helper] Attempting to find ASIN input directly (skipping Stow click)');
+          waitForAsinInputAndFill();
+        }
+      }, 500);
+    }
+
+    // Step 3: Fill the ASIN in the "Scan product barcode" input
+    function waitForAsinInputAndFill() {
+      let attempts = 0;
+      const interval = setInterval(() => {
+        attempts++;
+
+        let input = null;
+
+        // The tool content loads inside an iframe — check the ihm_inbound_tool iframe first
+        // (same pattern as hot pick script checking iframe[aria-label="inventory_viewer_v2"])
+        const toolIframe = document.querySelector('iframe[aria-label="ihm_inbound_tool"]') ||
+                           document.querySelector('iframe[aria-label*="inbound"]') ||
+                           document.querySelector('iframe[aria-label*="receive"]') ||
+                           document.querySelector('iframe[aria-label*="Receive"]');
+
+        if (toolIframe && toolIframe.contentDocument) {
+          try {
+            const iDoc = toolIframe.contentDocument;
+            input = iDoc.querySelector('input[data-id="OmniboxId"]') ||
+                    iDoc.querySelector('input[placeholder*="Scan"]') ||
+                    iDoc.querySelector('input[placeholder*="scan"]') ||
+                    iDoc.querySelector('input[placeholder*="product"]') ||
+                    iDoc.querySelector('input[placeholder*="barcode"]') ||
+                    iDoc.querySelector('input[placeholder*="ASIN"]') ||
+                    iDoc.querySelector('input[type="text"]');
+          } catch (e) {
+            if (attempts === 5) console.log('[Shortage Helper] Cannot access ihm_inbound_tool iframe (cross-origin):', e.message);
+          }
+        }
+
+        // Fallback: check all iframes
+        if (!input) {
+          const iframes = document.querySelectorAll('iframe');
+          for (const iframe of iframes) {
+            try {
+              const iDoc = iframe.contentDocument;
+              if (iDoc) {
+                input = iDoc.querySelector('input[data-id="OmniboxId"]') ||
+                        iDoc.querySelector('input[placeholder*="Scan"]') ||
+                        iDoc.querySelector('input[placeholder*="scan"]') ||
+                        iDoc.querySelector('input[placeholder*="product"]') ||
+                        iDoc.querySelector('input[placeholder*="barcode"]');
+                if (input) break;
+              }
+            } catch (e) {}
+          }
+        }
+
+        // Last resort: check parent document (but only specific selectors, not generic input[type="text"])
+        if (!input) {
+          input = document.querySelector('input[data-id="OmniboxId"]') ||
+                  document.querySelector('input[placeholder*="Scan product"]') ||
+                  document.querySelector('input[placeholder*="product barcode"]') ||
+                  document.querySelector('input[placeholder*="scan"]');
+        }
+
+        if (input) {
+          clearInterval(interval);
+          input.focus();
+          // Use native setter for React compatibility
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          setter.call(input, receiveAsin);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          console.log('[Shortage Helper] Filled ASIN in Receive Stow input:', receiveAsin, '| iframe:', toolIframe ? toolIframe.getAttribute('aria-label') : 'parent');
+
+          // Show banner
+          const banner = document.createElement('div');
+          banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;background:#0d9488;color:#fff;text-align:center;padding:12px 20px;font-size:16px;font-weight:bold;font-family:-apple-system,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,0.3);';
+          banner.textContent = '⌨️ Press ENTER to scan product: ' + receiveAsin;
+          document.body.insertBefore(banner, document.body.firstChild);
+          setTimeout(() => banner.remove(), 8000);
+        } else if (attempts >= 30) {
+          clearInterval(interval);
+          console.warn('[Shortage Helper] ASIN input not found in Receive Stow page after 15s');
+          // Log what iframes exist for debugging
+          const iframeLabels = Array.from(document.querySelectorAll('iframe')).map(f => f.getAttribute('aria-label') || f.src?.substring(0, 60) || 'no-label');
+          console.log('[Shortage Helper] Available iframes:', iframeLabels);
+        }
+      }, 500);
+    }
+  } // end runReceiveStowPage
 
 })(); // end IIFE
