@@ -67,6 +67,15 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Hardcoded Slack webhook URLs per FC (fallback to GM_getValue if not listed)
+  // ---------------------------------------------------------------------------
+
+  const SLACK_WEBHOOK_MAP = {
+    'UNC2': 'https://hooks.slack.com/triggers/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',
+    'UNY4': 'https://hooks.slack.com/triggers/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'
+  };
+
+  // ---------------------------------------------------------------------------
   // FC code detection (raw key, e.g., "UNC2")
   // ---------------------------------------------------------------------------
 
@@ -905,7 +914,7 @@
 
         // Webhook configuration
         const webhookKey = detectedFC ? 'slack_webhook_' + detectedFC : null;
-        const existingWebhook = webhookKey ? GM_getValue(webhookKey, '') : '';
+        const existingWebhook = (detectedFC && SLACK_WEBHOOK_MAP[detectedFC]) || (webhookKey ? GM_getValue(webhookKey, '') : '');
 
         const webhookSection = document.createElement('div');
         webhookSection.className = 'ihm-slack-webhook-section';
@@ -973,9 +982,8 @@
           statusArea.textContent = '';
           statusArea.className = 'ihm-slack-status';
 
-          // Get webhook URL
-          const wKey = 'slack_webhook_' + detectedFC;
-          const webhookUrl = GM_getValue(wKey, '');
+          // Get webhook URL — check user override first, then hardcoded map
+          const webhookUrl = GM_getValue('slack_webhook_' + detectedFC, '') || SLACK_WEBHOOK_MAP[detectedFC] || '';
           if (!webhookUrl || !validateWebhookUrl(webhookUrl)) {
             statusArea.textContent = 'No webhook configured for ' + detectedFC + '. Please configure one below.';
             statusArea.className = 'ihm-slack-status error';
@@ -991,27 +999,42 @@
           const cfr = calculateCFR(allRows);
           const motivationalMessage = getMotivationalMessage(cfr);
 
-          // Map transship shortage items to the expected format
-          const mappedShortages = shortages.map(item => ({
+          // Calculate raw CFR numbers
+          let totalExpected = 0;
+          let totalReceived = 0;
+          for (const row of allRows) {
+            if (row.expectedQty !== null && row.expectedQty !== undefined &&
+                row.receivedQty !== null && row.receivedQty !== undefined) {
+              totalExpected += row.expectedQty;
+              totalReceived += row.receivedQty;
+            }
+          }
+
+          // Map transship shortage items — only partial case shortages for Slack
+          const partialShortages = shortages.filter(item => !item.isFullCaseShortage);
+          const partialMapped = partialShortages.map(item => ({
             asin: item.asin,
-            productName: item.title,
+            productName: (item.title || 'Unknown').substring(0, 25),
             expectedQty: item.expectedQty,
             receivedQty: item.unpackedQty,
             shortageQty: item.expectedQty - item.unpackedQty
           }));
 
-          // Build shortages text
+          // Build shortages text — only partial case stows
+          const hasAnyShortages = shortages.length > 0;
           let shortagesText = 'None';
-          if (mappedShortages && mappedShortages.length > 0) {
+          if (partialMapped.length > 0) {
             const maxItems = 50;
-            const displayItems = mappedShortages.slice(0, maxItems);
+            const displayItems = partialMapped.slice(0, maxItems);
             const lines = displayItems.map(function (item) {
-              return '\u25b8 ' + item.asin + ' \u2014 ' + (item.productName || 'Unknown') + ' | ' + item.expectedQty + ' \u2192 ' + item.receivedQty + ' | Short: ' + item.shortageQty;
+              return '\u25b8 ' + item.asin + ' \u2014 ' + item.productName + ' | Exp: ' + item.expectedQty + ' | Rcv: ' + item.receivedQty + ' | Short: ' + item.shortageQty;
             });
-            if (mappedShortages.length > maxItems) {
-              lines.push('... and ' + (mappedShortages.length - maxItems) + ' more items');
+            if (partialMapped.length > maxItems) {
+              lines.push('... and ' + (partialMapped.length - maxItems) + ' more items');
             }
             shortagesText = lines.join('\n');
+          } else if (hasAnyShortages) {
+            shortagesText = 'No partial shortages (full case only)';
           }
 
           // Send individual fields to match workflow variables
@@ -1020,7 +1043,7 @@
             shipment_id: transshipId,
             fc_code: detectedFC,
             reconciler: getReconcilerUsername(),
-            cfr: cfr === 'N/A' ? 'N/A' : cfr + '%',
+            cfr: cfr === 'N/A' ? 'N/A' : totalReceived + ' received / ' + totalExpected + ' expected (' + cfr + '%)',
             cfr_message: motivationalMessage || '',
             shortages: shortagesText,
             notes: notesInput.value.trim() || 'None'
@@ -1302,6 +1325,7 @@
 
       // Target processes — all relevant receive/stow paths
       const TARGET_PROCESSES = [
+        'AutoStow',
         'AutoStow_CulQual_Destroy',
         'AutoStow_CulQual_Donate',
         'AutoStow_Damaged_Destroyed',
