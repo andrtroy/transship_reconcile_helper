@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Transship Shortage Helper 
+// @name         Transship Shortage Helper
 // @namespace    https://grocerycentral.amazon.dev/
-// @version      3.4.1
+// @version      3.5.0
 // @description  Adds a Shortage Review button to the IHM transship page, auto-fills filters on the Inventory Audit Dashboard, and links to Associate Tools Receive v3 Stow
 // @match        https://grocerycentral.amazon.dev/ihm-transship-dashboards/inbound-manifest-view-v2/
 // @match        https://grocerycentral.amazon.dev/ihm-transship-dashboards/inbound-manifest-view-v2/*
@@ -9,6 +9,9 @@
 // @match        https://grocerycentral.amazon.dev/ihm-inventory-audit-dashboard/inventory-audit-main-page*
 // @match        https://ui.us-west-2.prod.associatetools.ihm.amazon.dev/*
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -61,6 +64,99 @@
     const storeId = getCurrentStoreId();
     const base = 'https://ui.us-west-2.prod.associatetools.ihm.amazon.dev/remote/ihm-associate-tools-base/index.html';
     return `${base}?auth=midway&domain=prod&region=iad&storeId=${storeId}&shortage-receive-asin=${encodeURIComponent(asin)}#/home`;
+  }
+
+  // ---------------------------------------------------------------------------
+  // FC code detection (raw key, e.g., "UNC2")
+  // ---------------------------------------------------------------------------
+
+  function getCurrentFCCode() {
+    try {
+      const pageText = document.body ? document.body.innerText : '';
+      const siteKeys = Object.keys(SITE_CODE_MAP);
+      for (const key of siteKeys) {
+        if (pageText.includes(key)) return key;
+      }
+      const activeSiteData = localStorage.getItem('ACTIVE_SITE');
+      if (activeSiteData) {
+        const parsed = JSON.parse(activeSiteData);
+        const fcId = parsed.fcId || parsed.storeAcronym || '';
+        if (fcId && SITE_CODE_MAP[fcId]) return fcId;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reconciler username detection
+  // ---------------------------------------------------------------------------
+
+  function getReconcilerUsername() {
+    try {
+      // Strategy 1: Look for common user identity selectors
+      const selectors = [
+        '[data-testid*="user"]', '[class*="user-name"]', '[class*="username"]',
+        '[class*="user-info"]', '[class*="profile"]'
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          const text = el.textContent.trim();
+          if (text && text.length <= 64 && /^[a-z0-9._-]+$/i.test(text)) {
+            return text.substring(0, 64);
+          }
+        }
+      }
+      // Strategy 2: Look for short alphanumeric text in the header/nav area (top-right)
+      const headerEls = document.querySelectorAll('header, nav, [class*="header"], [class*="nav"], [class*="top-bar"]');
+      for (const header of headerEls) {
+        const spans = header.querySelectorAll('span, div, a, button');
+        for (const span of spans) {
+          const text = span.textContent.trim();
+          if (/^[a-z]{3,8}$/i.test(text) && span.children.length === 0) {
+            return text.substring(0, 64);
+          }
+        }
+      }
+      // Strategy 3: Look for any element with text matching Amazon login pattern near top of page
+      const allEls = document.querySelectorAll('span, div, a');
+      for (const el of allEls) {
+        if (el.getBoundingClientRect().top > 100) continue; // only check top area
+        const text = el.textContent.trim();
+        if (/^[a-z]{3,8}$/i.test(text) && el.children.length === 0) {
+          return text.substring(0, 64);
+        }
+      }
+    } catch (e) {
+      console.warn('[IHM Transship] Error detecting username:', e);
+    }
+    return 'Unknown';
+  }
+
+  // ---------------------------------------------------------------------------
+  // PO / Transship ID extraction
+  // ---------------------------------------------------------------------------
+
+  function getPOorTransshipId() {
+    try {
+      // Strategy 1: Extract from URL path (transship pages use different URL patterns)
+      const urlMatch = window.location.pathname.match(/\/inbound-manifest-view-v2\/([^/]+)/);
+      if (urlMatch && urlMatch[1]) return urlMatch[1];
+      // Strategy 2: Scrape from page header — look for transship/manifest ID patterns
+      const allEls = document.querySelectorAll('h1, h2, h3, strong, [class*="title"], [class*="header"]');
+      for (const el of allEls) {
+        const text = el.textContent.trim();
+        // Match patterns like "TS-12345" or alphanumeric IDs
+        const tsMatch = text.match(/(?:TS|Transship|Manifest)[:\s]*([A-Z0-9-]+)/i);
+        if (tsMatch && tsMatch[1]) return tsMatch[1];
+      }
+      // Strategy 3: Check URL hash or query params
+      const hashMatch = window.location.hash.match(/id=([^&]+)/);
+      if (hashMatch && hashMatch[1]) return decodeURIComponent(hashMatch[1]);
+    } catch (e) {
+      console.warn('[IHM Transship] Error extracting Transship ID:', e);
+    }
+    return 'Unknown';
   }
 
   const url = window.location.href;
@@ -229,9 +325,12 @@
 
         // Partial shortage: some units unpacked but not all
         // unpackedQty > 0 AND unpackedQty < expectedQty
+        // Full case shortage: unpackedQty === 0 (nothing received)
         if (isNaN(expectedQty) || isNaN(unpackedQty)) return;
-        if (unpackedQty <= 0) return; // nothing received yet — not a partial shortage
         if (unpackedQty >= expectedQty) return; // fully received — not a shortage
+
+        // Determine if this is a full case shortage (zero received)
+        const isFullCaseShortage = (unpackedQty === 0);
 
         // Find nearest tote ID from ancestor elements
         let toteId = '';
@@ -248,10 +347,163 @@
           ancestor = ancestor.parentElement;
         }
 
-        shortages.push({ asin, title, expectedQty, unpackedQty, toteId });
+        shortages.push({ asin, title, expectedQty, unpackedQty, toteId, isFullCaseShortage });
       });
 
       return shortages;
+    }
+
+    // -------------------------------------------------------------------------
+    // Scrape ALL line items (including fully received) for CFR calculation
+    // -------------------------------------------------------------------------
+
+    function scrapeAllLineItems() {
+      const doc = getDoc();
+      const allItems = [];
+      const asinPattern = /^[A-Z0-9]{10}$/i;
+
+      doc.querySelectorAll('tr').forEach((row) => {
+        const cells = Array.from(row.querySelectorAll('td'));
+        if (cells.length < 4) return;
+
+        const asin = cells[0].textContent.trim().replace(/\s+/g, '');
+        if (!asinPattern.test(asin)) return;
+
+        const expectedQty = parseInt(cells[2] ? cells[2].textContent.trim() : '0', 10);
+        const receivedQty = parseInt(cells[3] ? cells[3].textContent.trim() : '0', 10);
+
+        allItems.push({
+          expectedQty: isNaN(expectedQty) ? null : expectedQty,
+          receivedQty: isNaN(receivedQty) ? null : receivedQty
+        });
+      });
+
+      return allItems;
+    }
+
+    // -------------------------------------------------------------------------
+    // Slack Reporter — Pure Functions
+    // -------------------------------------------------------------------------
+
+    function calculateCFR(lineItems) {
+      let totalExpected = 0;
+      let totalReceived = 0;
+      for (const item of lineItems) {
+        if (item.expectedQty === null || item.expectedQty === undefined ||
+            item.receivedQty === null || item.receivedQty === undefined) {
+          continue; // exclude items with unparseable quantities
+        }
+        totalExpected += item.expectedQty;
+        totalReceived += item.receivedQty;
+      }
+      if (totalExpected === 0) return 'N/A';
+      return Math.round((totalReceived / totalExpected) * 1000) / 10;
+    }
+
+    function getMotivationalMessage(cfr) {
+      if (cfr === 'N/A') return null;
+      if (cfr >= 100.0) return 'Outstanding work! Thank you';
+      if (cfr >= 98.0) return 'Good job';
+      if (cfr >= 96.0) return 'Follow up recommended';
+      return 'Escalate to Site Lead';
+    }
+
+    function validateWebhookUrl(url) {
+      if (!url || typeof url !== 'string') return false;
+      const trimmed = url.trim();
+      return (trimmed.startsWith('https://hooks.slack.com/services/') && trimmed.length > 'https://hooks.slack.com/services/'.length) ||
+             (trimmed.startsWith('https://hooks.slack.com/triggers/') && trimmed.length > 'https://hooks.slack.com/triggers/'.length);
+    }
+
+    function composeSlackMessage(params) {
+      const { poOrTransshipId, fcCode, reconcilerUsername, cfr, motivationalMessage, shortages, notes } = params;
+      const lines = [];
+      lines.push('*Transship Reconciliation Report*');
+      lines.push('*Transship:* ' + poOrTransshipId);
+      lines.push('*FC:* ' + fcCode);
+      lines.push('*Reconciler:* ' + reconcilerUsername);
+
+      if (cfr === 'N/A') {
+        lines.push('*CFR:* N/A');
+      } else {
+        const cfrLine = '*CFR:* ' + cfr + '%' + (motivationalMessage ? ' — ' + motivationalMessage : '');
+        lines.push(cfrLine);
+      }
+
+      if (shortages && shortages.length > 0) {
+        lines.push('');
+        lines.push('*Shortages (' + shortages.length + ' item' + (shortages.length !== 1 ? 's' : '') + '):*');
+        const maxItems = 50;
+        const displayItems = shortages.slice(0, maxItems);
+        for (const item of displayItems) {
+          lines.push('• `' + item.asin + '` — ' + (item.productName || 'Unknown') + ' | Expected: ' + item.expectedQty + ' | Received: ' + item.receivedQty + ' | Short: ' + item.shortageQty);
+        }
+        if (shortages.length > maxItems) {
+          lines.push('... and ' + (shortages.length - maxItems) + ' more items');
+        }
+      }
+
+      if (notes && notes.trim()) {
+        lines.push('');
+        lines.push('*Notes:* ' + notes.trim());
+      }
+
+      let message = lines.join('\n');
+
+      // Truncate if exceeds 3000 characters
+      if (message.length > 3000) {
+        // Rebuild with fewer shortage items until it fits
+        const headerEnd = message.indexOf('*Shortages');
+        if (headerEnd > 0 && shortages && shortages.length > 0) {
+          const header = message.substring(0, headerEnd);
+          const footer = (notes && notes.trim()) ? '\n\n*Notes:* ' + notes.trim() : '';
+          const available = 3000 - header.length - footer.length - 50; // 50 chars buffer for truncation indicator
+          const shortageLines = [];
+          let charCount = 0;
+          let itemCount = 0;
+          for (const item of shortages) {
+            const line = '• `' + item.asin + '` — ' + (item.productName || 'Unknown') + ' | Expected: ' + item.expectedQty + ' | Received: ' + item.receivedQty + ' | Short: ' + item.shortageQty;
+            if (charCount + line.length + 1 > available) break;
+            shortageLines.push(line);
+            charCount += line.length + 1;
+            itemCount++;
+          }
+          const remaining = shortages.length - itemCount;
+          const shortageSection = '*Shortages (' + shortages.length + ' item' + (shortages.length !== 1 ? 's' : '') + '):*\n' + shortageLines.join('\n') + (remaining > 0 ? '\n... and ' + remaining + ' more items' : '');
+          message = header + shortageSection + footer;
+        }
+        // Final safety truncation
+        if (message.length > 3000) {
+          message = message.substring(0, 2997) + '...';
+        }
+      }
+
+      return message;
+    }
+
+    function sendToSlack(webhookUrl, data) {
+      return new Promise(function (resolve) {
+        GM_xmlhttpRequest({
+          method: 'POST',
+          url: webhookUrl,
+          headers: { 'Content-Type': 'application/json' },
+          data: JSON.stringify(data),
+          timeout: 30000,
+          onload: function (response) {
+            if (response.status === 200 || response.status === 202) {
+              resolve({ success: true });
+            } else {
+              resolve({ success: false, statusCode: response.status, error: 'HTTP ' + response.status });
+            }
+          },
+          onerror: function () {
+            resolve({ success: false, error: 'Network error — check your connection.' });
+          },
+          ontimeout: function () {
+            resolve({ success: false, error: 'Request timed out after 30 seconds.' });
+          }
+        });
+      });
     }
 
     // -------------------------------------------------------------------------
@@ -308,9 +560,44 @@
       }
       .ihm-shortage-review-btn:hover { background: #e8f4fb; }
       .ihm-summary { font-size: 12px; color: #666; margin-bottom: 12px; }
+      .ihm-full-case-row { background: #ffebee !important; font-weight: 700; color: #000; }
+      .ihm-full-case-row td { background: #ffebee !important; font-weight: 700; color: #000; }
       @keyframes ihm-spin {
         0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); }
       }
+      .ihm-slack-section {
+        margin-top: 20px; padding-top: 16px; border-top: 1px solid #e0e0e0;
+      }
+      .ihm-slack-field { margin-bottom: 10px; font-size: 13px; }
+      .ihm-slack-field label { font-weight: 600; color: #444; display: block; margin-bottom: 4px; }
+      .ihm-slack-field .ihm-slack-value { color: #111; font-family: monospace; font-size: 12px; }
+      .ihm-slack-notes {
+        width: 100%; min-height: 60px; max-height: 120px; resize: vertical;
+        border: 1px solid #ccc; border-radius: 4px; padding: 8px;
+        font-size: 13px; font-family: inherit;
+      }
+      .ihm-slack-notes:focus { border-color: #0073bb; outline: none; }
+      .ihm-slack-char-count { font-size: 11px; color: #888; text-align: right; margin-top: 2px; }
+      .ihm-slack-send-btn {
+        background: #1264a3; color: #fff; border: none; padding: 8px 18px;
+        border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600;
+        margin-top: 12px;
+      }
+      .ihm-slack-send-btn:hover { background: #0d4f82; }
+      .ihm-slack-send-btn:disabled { background: #999; cursor: not-allowed; }
+      .ihm-slack-status { margin-top: 8px; font-size: 12px; }
+      .ihm-slack-status.success { color: #2e7d32; }
+      .ihm-slack-status.error { color: #c00; }
+      .ihm-slack-webhook-section { margin-top: 12px; padding: 12px; background: #f9f9f9; border-radius: 4px; border: 1px solid #e0e0e0; }
+      .ihm-slack-webhook-input {
+        width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;
+        font-size: 12px; font-family: monospace; margin-top: 4px;
+      }
+      .ihm-slack-webhook-save {
+        background: #0073bb; color: #fff; border: none; padding: 6px 12px;
+        border-radius: 4px; cursor: pointer; font-size: 12px; margin-top: 8px;
+      }
+      .ihm-slack-webhook-save:hover { background: #005a8c; }
     `);
 
     // -------------------------------------------------------------------------
@@ -404,10 +691,9 @@
         if (shortages.length === 0) {
           const msg = document.createElement('p');
           msg.className = 'ihm-empty-msg';
-          msg.textContent = 'No partial case shortages found for this transship.';
+          msg.textContent = 'No shortages found for this transship.';
           body.appendChild(msg);
-          return;
-        }
+        } else {
 
         const summary = document.createElement('p');
         summary.className = 'ihm-summary';
@@ -427,9 +713,19 @@
         thead.appendChild(hRow);
         table.appendChild(thead);
 
+        // Sort: partial shortages first, full case shortages underneath
+        const sortedShortages = shortages.slice().sort(function (a, b) {
+          if (a.isFullCaseShortage === b.isFullCaseShortage) return 0;
+          return a.isFullCaseShortage ? 1 : -1;
+        });
         const tbody = document.createElement('tbody');
-        shortages.forEach(item => {
+        sortedShortages.forEach(item => {
           const tr = document.createElement('tr');
+
+          // Apply full case shortage highlighting (zero units received)
+          if (item.isFullCaseShortage) {
+            tr.className = 'ihm-full-case-row';
+          }
 
           const tdAsin = document.createElement('td');
           tdAsin.className = 'ihm-asin';
@@ -547,6 +843,200 @@
                 }
               });
             }
+          }
+        });
+        } // end else (shortages.length > 0)
+
+        // --- Slack Reporter Section ---
+        const slackSection = document.createElement('div');
+        slackSection.className = 'ihm-slack-section';
+
+        // FC Code display
+        const fcField = document.createElement('div');
+        fcField.className = 'ihm-slack-field';
+        const fcLabel = document.createElement('label');
+        fcLabel.textContent = 'FC:';
+        const fcValue = document.createElement('span');
+        fcValue.className = 'ihm-slack-value';
+        const detectedFC = getCurrentFCCode();
+        fcValue.textContent = detectedFC || 'Not detected';
+        fcField.appendChild(fcLabel);
+        fcField.appendChild(fcValue);
+        slackSection.appendChild(fcField);
+
+        // Reconciler Username display
+        const userField = document.createElement('div');
+        userField.className = 'ihm-slack-field';
+        const userLabel = document.createElement('label');
+        userLabel.textContent = 'Reconciler:';
+        const userValue = document.createElement('span');
+        userValue.className = 'ihm-slack-value';
+        userValue.textContent = getReconcilerUsername();
+        userField.appendChild(userLabel);
+        userField.appendChild(userValue);
+        slackSection.appendChild(userField);
+
+        // Notes textarea
+        const notesField = document.createElement('div');
+        notesField.className = 'ihm-slack-field';
+        const notesLabel = document.createElement('label');
+        notesLabel.textContent = 'Notes:';
+        const notesInput = document.createElement('textarea');
+        notesInput.className = 'ihm-slack-notes';
+        notesInput.maxLength = 1000;
+        notesInput.placeholder = 'Add any notes about this reconciliation...';
+        const charCount = document.createElement('div');
+        charCount.className = 'ihm-slack-char-count';
+        charCount.textContent = '0 / 1000';
+        notesInput.addEventListener('input', function () {
+          charCount.textContent = notesInput.value.length + ' / 1000';
+        });
+        notesField.appendChild(notesLabel);
+        notesField.appendChild(notesInput);
+        notesField.appendChild(charCount);
+        slackSection.appendChild(notesField);
+
+        // Send to Slack button
+        const sendBtn = document.createElement('button');
+        sendBtn.className = 'ihm-slack-send-btn';
+        sendBtn.textContent = 'Send to Slack';
+        sendBtn.setAttribute('aria-label', 'Send to Slack');
+        slackSection.appendChild(sendBtn);
+
+        // Webhook configuration
+        const webhookKey = detectedFC ? 'slack_webhook_' + detectedFC : null;
+        const existingWebhook = webhookKey ? GM_getValue(webhookKey, '') : '';
+
+        const webhookSection = document.createElement('div');
+        webhookSection.className = 'ihm-slack-webhook-section';
+        const webhookLabel = document.createElement('label');
+        webhookLabel.style.cssText = 'font-size:12px;font-weight:600;color:#444;display:block';
+        webhookLabel.textContent = existingWebhook ? 'Update Webhook URL for ' + detectedFC + ':' : 'Configure Webhook URL for ' + (detectedFC || 'this FC') + ':';
+        const webhookInput = document.createElement('input');
+        webhookInput.className = 'ihm-slack-webhook-input';
+        webhookInput.type = 'text';
+        webhookInput.placeholder = 'https://hooks.slack.com/services/... or /triggers/...';
+        webhookInput.value = existingWebhook;
+        const webhookSaveBtn = document.createElement('button');
+        webhookSaveBtn.className = 'ihm-slack-webhook-save';
+        webhookSaveBtn.textContent = existingWebhook ? 'Update Webhook' : 'Save Webhook';
+        const webhookStatus = document.createElement('div');
+        webhookStatus.style.cssText = 'font-size:11px;margin-top:4px';
+
+        webhookSaveBtn.addEventListener('click', function () {
+          const url = webhookInput.value.trim();
+          if (!validateWebhookUrl(url)) {
+            webhookStatus.style.color = '#c00';
+            webhookStatus.textContent = 'Invalid URL. Must match: https://hooks.slack.com/services/... or /triggers/...';
+            return;
+          }
+          if (webhookKey) {
+            GM_setValue(webhookKey, url);
+            webhookStatus.style.color = '#2e7d32';
+            webhookStatus.textContent = 'Webhook saved for ' + detectedFC + '!';
+            webhookSaveBtn.textContent = 'Update Webhook';
+            webhookLabel.textContent = 'Update Webhook URL for ' + detectedFC + ':';
+          }
+        });
+
+        webhookSection.appendChild(webhookLabel);
+        webhookSection.appendChild(webhookInput);
+        webhookSection.appendChild(webhookSaveBtn);
+        webhookSection.appendChild(webhookStatus);
+
+        // Status area
+        const statusArea = document.createElement('div');
+        statusArea.className = 'ihm-slack-status';
+        slackSection.appendChild(statusArea);
+
+        // Only show webhook config if FC is detected
+        if (detectedFC) {
+          slackSection.insertBefore(webhookSection, statusArea);
+        }
+
+        body.appendChild(slackSection);
+
+        // Disable send if FC not detected or Transship ID not found
+        const transshipId = getPOorTransshipId();
+        if (!detectedFC) {
+          sendBtn.disabled = true;
+          statusArea.textContent = 'Cannot send: FC not detected from page.';
+          statusArea.className = 'ihm-slack-status error';
+        }
+        if (transshipId === 'Unknown') {
+          console.warn('[IHM Transship] Transship ID could not be determined');
+        }
+
+        // --- Send to Slack click handler ---
+        sendBtn.addEventListener('click', async function () {
+          // Clear previous status
+          statusArea.textContent = '';
+          statusArea.className = 'ihm-slack-status';
+
+          // Get webhook URL
+          const wKey = 'slack_webhook_' + detectedFC;
+          const webhookUrl = GM_getValue(wKey, '');
+          if (!webhookUrl || !validateWebhookUrl(webhookUrl)) {
+            statusArea.textContent = 'No webhook configured for ' + detectedFC + '. Please configure one below.';
+            statusArea.className = 'ihm-slack-status error';
+            return;
+          }
+
+          // Disable button and show loading
+          sendBtn.disabled = true;
+          sendBtn.textContent = 'Sending...';
+
+          // Calculate CFR from ALL line items (not just shortages)
+          const allRows = scrapeAllLineItems();
+          const cfr = calculateCFR(allRows);
+          const motivationalMessage = getMotivationalMessage(cfr);
+
+          // Map transship shortage items to the expected format
+          const mappedShortages = shortages.map(item => ({
+            asin: item.asin,
+            productName: item.title,
+            expectedQty: item.expectedQty,
+            receivedQty: item.unpackedQty,
+            shortageQty: item.expectedQty - item.unpackedQty
+          }));
+
+          // Build shortages text
+          let shortagesText = 'None';
+          if (mappedShortages && mappedShortages.length > 0) {
+            const maxItems = 50;
+            const displayItems = mappedShortages.slice(0, maxItems);
+            const lines = displayItems.map(function (item) {
+              return '\u25b8 ' + item.asin + ' \u2014 ' + (item.productName || 'Unknown') + ' | ' + item.expectedQty + ' \u2192 ' + item.receivedQty + ' | Short: ' + item.shortageQty;
+            });
+            if (mappedShortages.length > maxItems) {
+              lines.push('... and ' + (mappedShortages.length - maxItems) + ' more items');
+            }
+            shortagesText = lines.join('\n');
+          }
+
+          // Send individual fields to match workflow variables
+          const slackData = {
+            report_type: 'Transship Reconciliation Report',
+            shipment_id: transshipId,
+            fc_code: detectedFC,
+            reconciler: getReconcilerUsername(),
+            cfr: cfr === 'N/A' ? 'N/A' : cfr + '%',
+            cfr_message: motivationalMessage || '',
+            shortages: shortagesText,
+            notes: notesInput.value.trim() || 'None'
+          };
+
+          const result = await sendToSlack(webhookUrl, slackData);
+
+          if (result.success) {
+            sendBtn.style.display = 'none';
+            statusArea.textContent = '\u2713 Sent to Slack successfully!';
+            statusArea.className = 'ihm-slack-status success';
+          } else {
+            sendBtn.disabled = false;
+            sendBtn.textContent = 'Send to Slack';
+            statusArea.textContent = 'Error: ' + (result.error || 'Unknown error');
+            statusArea.className = 'ihm-slack-status error';
           }
         });
       }
@@ -810,9 +1300,25 @@
         console.warn('[IHM Audit] ASIN input not found');
       }
 
-      // Target processes — only ReceiveV3_Stow
+      // Target processes — all relevant receive/stow paths
       const TARGET_PROCESSES = [
-        'ReceiveV3_Stow'
+        'AutoStow_CulQual_Destroy',
+        'AutoStow_CulQual_Donate',
+        'AutoStow_Damaged_Destroyed',
+        'AutoStow_Damaged_Donated',
+        'AutoStow_Expired_Destroyed',
+        'AutoStow_Expired_Donated',
+        'AutoStow_FOUND',
+        'AutoStow_Rec_Damaged_Destroyed',
+        'AutoStow_Rec_Damaged_Donated',
+        'AutoStow_Rec_Expired_Destroyed',
+        'AutoStow_Rec_Expired_Donated',
+        'AutoStow_Recalled_Destroyed',
+        'AutoStow_RECEIVED',
+        'ReceiveV3',
+        'ReceiveV3_Stow',
+        'ReceiveV3_Stow_adhoc',
+        'ReceiveV3_Stow_prev_short'
       ];
 
       // Find and click the dropdown trigger to open it
@@ -859,111 +1365,85 @@
         }
       }
 
-      // Open dropdown, wait for items, click the 7 targets, then click Filter
+      // Open dropdown, select target processes via React internals, then click Filter
       function selectProcessesThenFilter() {
         const trigger = findDropdownTrigger();
-        if (trigger) {
-          triggerDropdownOpen(trigger);
-          console.log('[IHM Audit] Opened process dropdown, trigger text:', trigger.textContent.trim());
-        } else {
-          console.warn('[IHM Audit] Process dropdown trigger not found — all button texts:',
-            Array.from(document.querySelectorAll('button')).map(b => b.textContent.trim()).filter(t => t).slice(0, 15));
-          // Click Filter anyway with whatever processes are selected
+        if (!trigger) {
+          console.warn('[IHM Audit] Process dropdown trigger not found');
           const filterBtn = findButtonByText('filter');
           if (filterBtn) { filterBtn.click(); console.log('[IHM Audit] Clicked Filter (no dropdown found)'); }
           return;
         }
 
-        // Poll for list items to appear in the DOM
-        let attempts = 0;
-        const poll = setInterval(() => {
-          attempts++;
+        // Find the combobox input inside the process-select container
+        const container = document.querySelector('[data-testid="process-select"]') || trigger.closest('[class*="select"], [class*="dropdown"]') || trigger;
+        const comboInput = container.querySelector('input[role="combobox"]') || container.querySelector('input') || trigger;
 
-          // Find all leaf text elements matching our target process names
-          // Check entire document including portals rendered at body level
-          const matches = Array.from(document.querySelectorAll(
-            'button, li, [role="option"], [role="menuitem"], [role="listitem"], ' +
-            '.mds-list-item, [class*="list-item"], [class*="option"], ' +
-            '[class*="menu-item"], [class*="dropdown-item"]'
-          )).filter(el => {
-            const text = el.textContent.trim();
-            return TARGET_PROCESSES.some(p => text === p || text === p.toLowerCase());
-          });
+        function openDropdown(callback) {
+          comboInput.focus();
+          comboInput.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+          comboInput.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+          comboInput.click();
+          requestAnimationFrame(() => requestAnimationFrame(callback));
+        }
 
-          // Also check plain span/div leaf nodes and buttons
-          const leafMatches = Array.from(document.querySelectorAll('span, div, button'))
-            .filter(el => {
-              const text = el.textContent.trim();
-              return TARGET_PROCESSES.some(p => text === p || text === p.toLowerCase());
-            });
+        openDropdown(() => {
+          console.log('[IHM Audit] Dropdown opened, looking for React fiber...');
 
-          const allMatches = [...new Set([...matches, ...leafMatches])];
-          console.log(`[IHM Audit] Process poll attempt ${attempts}: found ${allMatches.length} matching items`, allMatches.map(el => el.textContent.trim()));
-
-          if (allMatches.length === 0 && attempts === 3) {
-            // Log body children to find where the portal is rendering
-            const bodyChildren = Array.from(document.body.children).map(el =>
-              `${el.tagName}#${el.id}.${el.className.toString().split(' ')[0]}`
-            );
-            console.log('[IHM Audit] Body children:', bodyChildren);
-            // Log all li elements anywhere in document
-            const allLi = Array.from(document.querySelectorAll('li'))
-              .map(el => el.textContent.trim()).filter(t => t && t.length < 80).slice(0, 30);
-            console.log('[IHM Audit] All li elements:', allLi);
-            // Log all button texts to see what's in the dropdown
-            const allBtns = Array.from(document.querySelectorAll('button'))
-              .map(b => b.textContent.trim()).filter(t => t && t.length < 60);
-            console.log('[IHM Audit] All button texts:', allBtns);
+          const listbox = document.querySelector('[role="listbox"]');
+          if (!listbox) {
+            console.warn('[IHM Audit] No listbox found, falling back to trigger open');
+            triggerDropdownOpen(trigger);
+            setTimeout(() => {
+              const filterBtn = findButtonByText('filter');
+              if (filterBtn) filterBtn.click();
+            }, 500);
+            return;
           }
 
-          if (allMatches.length > 0) {
-            clearInterval(poll);
+          // Walk up the React fiber tree to find onChange with value prop
+          const fk = Object.keys(listbox).find(k => k.startsWith('__reactFiber'));
+          const fiber = fk ? listbox[fk] : null;
+          let current = fiber;
+          let depth = 0;
+          let found = false;
 
-            // Deduplicate — each process name should only be clicked ONCE
-            const seen = new Set();
-            const uniqueMatches = allMatches.filter(el => {
-              const text = el.textContent.trim();
-              if (seen.has(text)) return false;
-              seen.add(text);
-              return true;
-            });
-            console.log('[IHM Audit] Unique items to click:', uniqueMatches.map(el => el.textContent.trim()));
-
-            let idx = 0;
-            function clickNext() {
-              if (idx >= uniqueMatches.length) {
-                console.log('[IHM Audit] All processes clicked');
-                setTimeout(() => {
-                  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-                  setTimeout(() => {
-                    const filterBtn = findButtonByText('filter');
-                    if (filterBtn) { filterBtn.click(); console.log('[IHM Audit] Clicked Filter'); }
-                  }, 400);
-                }, 300);
-                return;
+          while (current && depth < 50) {
+            const props = current.memoizedProps;
+            if (props && props.onChange && props.value !== undefined) {
+              console.log('[IHM Audit] Found onChange at fiber depth', depth);
+              try {
+                props.onChange(TARGET_PROCESSES);
+                found = true;
+                console.log('[IHM Audit] onChange called with', TARGET_PROCESSES.length, 'processes (string array)');
+              } catch (e) {
+                try {
+                  props.onChange(TARGET_PROCESSES.map(s => ({ label: s, value: s })));
+                  found = true;
+                  console.log('[IHM Audit] onChange called with', TARGET_PROCESSES.length, 'processes (object array)');
+                } catch (e2) {
+                  console.warn('[IHM Audit] onChange failed:', e2.message);
+                }
               }
-              const el = uniqueMatches[idx];
-              // The element IS a button — click it directly
-              const btn = el.tagName === 'BUTTON' ? el : (el.closest('button') || el.closest('li, [role="option"]') || el);
-              btn.scrollIntoView({ block: 'nearest' });
-              console.log('[IHM Audit] Clicking:', el.textContent.trim(), '| tag:', btn.tagName);
-              btn.click();
-              idx++;
-              setTimeout(clickNext, 300);
+              break;
             }
-            clickNext();
-
-          } else if (attempts >= 15) {
-            clearInterval(poll);
-            console.warn('[IHM Audit] Process items not found after 15 attempts — clicking Filter anyway');
-            // Log what list items exist for debugging
-            const allLi = Array.from(document.querySelectorAll('li, [role="option"]'))
-              .map(el => el.textContent.trim()).filter(t => t && t.length < 60).slice(0, 20);
-            console.log('[IHM Audit] Visible list items:', allLi);
-            const filterBtn = findButtonByText('filter');
-            if (filterBtn) filterBtn.click();
+            current = current.return;
+            depth++;
           }
-        }, 300);
+
+          if (!found) {
+            console.warn('[IHM Audit] Could not find onChange with value prop after', depth, 'levels');
+          }
+
+          // Close dropdown and click Filter
+          setTimeout(() => {
+            comboInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+            setTimeout(() => {
+              const filterBtn = findButtonByText('filter');
+              if (filterBtn) { filterBtn.click(); console.log('[IHM Audit] Clicked Filter'); }
+            }, 400);
+          }, 500);
+        });
       }
 
       // Guard: only run process selection once
@@ -1096,7 +1576,7 @@
         const cells = Array.from(row.querySelectorAll('td'));
         if (!cells.length) return;
         const process = cells[processIdx] ? cells[processIdx].textContent.trim() : '';
-        if (process !== 'ReceiveV3_Stow') return;
+        if (process !== 'ReceiveV3_Stow' && process !== 'AutoStow_RECEIVED') return;
         const location = cells[locationIdx] ? cells[locationIdx].textContent.trim() : '';
         const quantity = cells[qtyIdx] ? cells[qtyIdx].textContent.trim() : '';
         stowRows.push({ location, quantity });
@@ -1276,7 +1756,7 @@
             .slice(0, 30);
           console.log('[Shortage Helper] Visible clickable elements (attempt ' + attempts + '):', visibleTexts);
         }
-
+        
         // Search in parent document — match "Stow" case-insensitively and also partial matches
         let found = false;
         const allEls = document.querySelectorAll('a, button, div, span, tr, td, li, [role="tab"], [role="button"], [role="menuitem"]');
@@ -1296,7 +1776,7 @@
             return;
           }
         }
-
+        
         // Search inside iframes
         if (!found) {
           const iframes = document.querySelectorAll('iframe');
@@ -1323,7 +1803,7 @@
             }
           }
         }
-
+        
         if (attempts >= 30) {
           clearInterval(interval);
           console.warn('[Shortage Helper] Stow option not found after 15s');
