@@ -72,7 +72,10 @@
 
   const SLACK_WEBHOOK_MAP = {
     'UNC2': 'https://hooks.slack.com/triggers/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',
-    'UNY4': 'https://hooks.slack.com/triggers/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'
+    'UNY4': 'https://hooks.slack.com/triggers/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',
+    'UGA2': 'https://hooks.slack.com/triggers/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',
+    'UNC3': 'https://hooks.slack.com/triggers/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',
+    'UGA4': 'https://hooks.slack.com/triggers/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'
   };
 
   // ---------------------------------------------------------------------------
@@ -388,6 +391,84 @@
       });
 
       return allItems;
+    }
+
+    // -------------------------------------------------------------------------
+    // Price Fetching — Scrape retail price from amazon.com product pages
+    // -------------------------------------------------------------------------
+
+    function fetchPrice(asin) {
+      return new Promise(function (resolve) {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: 'https://www.amazon.com/dp/' + asin,
+          headers: {
+            'Accept': 'text/html',
+            'Accept-Language': 'en-US,en;q=0.9'
+          },
+          timeout: 10000,
+          onload: function (response) {
+            if (response.status === 200) {
+              const html = response.responseText;
+              const patterns = [
+                /class="a-price-whole">(\d+)<.*?class="a-price-fraction">(\d+)</,
+                /id="priceblock_ourprice"[^>]*>\s*\$?([\d,.]+)/,
+                /id="priceblock_dealprice"[^>]*>\s*\$?([\d,.]+)/,
+                /class="a-offscreen">\s*\$?([\d,.]+)/,
+                /"price":\s*"?([\d.]+)"?/,
+                /data-a-color="price"[^>]*>.*?\$?([\d,.]+)/s
+              ];
+              for (const pattern of patterns) {
+                const match = html.match(pattern);
+                if (match) {
+                  let price;
+                  if (match[2]) {
+                    price = parseFloat(match[1] + '.' + match[2]);
+                  } else {
+                    price = parseFloat(match[1].replace(/,/g, ''));
+                  }
+                  if (!isNaN(price) && price > 0 && price < 10000) {
+                    resolve({ asin: asin, price: price, found: true });
+                    return;
+                  }
+                }
+              }
+              resolve({ asin: asin, price: null, found: false });
+            } else {
+              resolve({ asin: asin, price: null, found: false });
+            }
+          },
+          onerror: function () {
+            resolve({ asin: asin, price: null, found: false });
+          },
+          ontimeout: function () {
+            resolve({ asin: asin, price: null, found: false });
+          }
+        });
+      });
+    }
+
+    function fetchPricesThrottled(asins, delayMs) {
+      delayMs = delayMs || 1000;
+      return new Promise(function (resolve) {
+        const results = {};
+        let index = 0;
+
+        function fetchNext() {
+          if (index >= asins.length) {
+            resolve(results);
+            return;
+          }
+          const asin = asins[index];
+          index++;
+          fetchPrice(asin).then(function (result) {
+            results[asin] = result.price;
+            setTimeout(fetchNext, delayMs);
+          });
+        }
+
+        fetchNext();
+      });
     }
 
     // -------------------------------------------------------------------------
@@ -856,6 +937,56 @@
         });
         } // end else (shortages.length > 0)
 
+        // --- Price Impact Section ---
+        const priceSection = document.createElement('div');
+        priceSection.style.cssText = 'margin-top:16px;padding-top:12px;border-top:1px solid #e0e0e0';
+
+        const priceBtn = document.createElement('button');
+        priceBtn.style.cssText = 'background:#f57c00;color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600';
+        priceBtn.textContent = 'Fetch Prices & Calculate $ Impact';
+        const priceStatus = document.createElement('div');
+        priceStatus.style.cssText = 'margin-top:8px;font-size:12px;color:#555';
+
+        priceBtn.addEventListener('click', async function () {
+          priceBtn.disabled = true;
+          priceBtn.style.background = '#999';
+          priceBtn.textContent = 'Fetching prices...';
+          priceStatus.textContent = 'Fetching prices from Amazon (1 per second)...';
+
+          const uniqueAsins = [...new Set(shortages.map(function (s) { return s.asin; }))];
+          const prices = await fetchPricesThrottled(uniqueAsins, 1200);
+
+          let totalImpact = 0;
+          let foundCount = 0;
+          shortages.forEach(function (item) {
+            const price = prices[item.asin];
+            if (price) {
+              foundCount++;
+              const shortQty = item.expectedQty - item.unpackedQty;
+              totalImpact += price * shortQty;
+            }
+          });
+
+          priceBtn.style.display = 'none';
+          if (foundCount > 0) {
+            priceStatus.innerHTML = '<strong style="color:#b71c1c;font-size:14px">Total $ Impact: $' + totalImpact.toFixed(2) + '</strong><br><span style="font-size:11px;color:#666">(' + foundCount + '/' + uniqueAsins.length + ' ASINs priced at retail)</span>';
+          } else {
+            priceStatus.textContent = 'Could not fetch prices. Amazon may be blocking requests.';
+            priceStatus.style.color = '#c00';
+          }
+
+          // Store for Slack message
+          priceSection.dataset.totalImpact = totalImpact.toFixed(2);
+          priceSection.dataset.foundCount = foundCount;
+          priceSection.dataset.totalAsins = uniqueAsins.length;
+        });
+
+        priceSection.appendChild(priceBtn);
+        priceSection.appendChild(priceStatus);
+        if (shortages.length > 0) {
+          body.appendChild(priceSection);
+        }
+
         // --- Slack Reporter Section ---
         const slackSection = document.createElement('div');
         slackSection.className = 'ihm-slack-section';
@@ -1046,7 +1177,14 @@
             cfr: cfr === 'N/A' ? 'N/A' : totalReceived + ' received / ' + totalExpected + ' expected (' + cfr + '%)',
             cfr_message: motivationalMessage || '',
             shortages: shortagesText,
-            notes: notesInput.value.trim() || 'None'
+            notes: (function () {
+              let n = '';
+              if (priceSection.dataset.totalImpact && parseFloat(priceSection.dataset.totalImpact) > 0) {
+                n += '\uD83D\uDEA8 *$' + priceSection.dataset.totalImpact + ' estimated impact*\n';
+              }
+              n += notesInput.value.trim() || 'None';
+              return n;
+            })()
           };
 
           const result = await sendToSlack(webhookUrl, slackData);
@@ -1780,7 +1918,7 @@
             .slice(0, 30);
           console.log('[Shortage Helper] Visible clickable elements (attempt ' + attempts + '):', visibleTexts);
         }
-        
+
         // Search in parent document — match "Stow" case-insensitively and also partial matches
         let found = false;
         const allEls = document.querySelectorAll('a, button, div, span, tr, td, li, [role="tab"], [role="button"], [role="menuitem"]');
@@ -1800,7 +1938,7 @@
             return;
           }
         }
-        
+
         // Search inside iframes
         if (!found) {
           const iframes = document.querySelectorAll('iframe');
@@ -1827,7 +1965,7 @@
             }
           }
         }
-        
+
         if (attempts >= 30) {
           clearInterval(interval);
           console.warn('[Shortage Helper] Stow option not found after 15s');
