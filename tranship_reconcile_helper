@@ -43,19 +43,9 @@
 
   function getCurrentStoreId() {
     try {
-      // Read from page text — look for "Houdini FC: UNC2" or similar pattern
-      const pageText = document.body ? document.body.innerText : '';
-      const siteKeys = Object.keys(SITE_CODE_MAP);
-      for (const key of siteKeys) {
-        if (pageText.includes(key)) return SITE_CODE_MAP[key];
-      }
-      // Fallback: check localStorage ACTIVE_SITE (set by Store Management pages)
-      const activeSiteData = localStorage.getItem('ACTIVE_SITE');
-      if (activeSiteData) {
-        const parsed = JSON.parse(activeSiteData);
-        const fcId = parsed.fcId || parsed.storeAcronym || '';
-        if (fcId && SITE_CODE_MAP[fcId]) return SITE_CODE_MAP[fcId];
-      }
+      // Use getCurrentFCCode() for consistent detection, then map to store ID
+      const fcCode = getCurrentFCCode();
+      if (fcCode && SITE_CODE_MAP[fcCode]) return SITE_CODE_MAP[fcCode];
     } catch (e) {}
     return 'US-NC-24';
   }
@@ -80,22 +70,64 @@
 
   // ---------------------------------------------------------------------------
   // FC code detection (raw key, e.g., "UNC2")
+  // Uses targeted detection to avoid false matches from unrelated page text.
+  // Priority: 1) "Houdini FC: XXXX" element, 2) localStorage ACTIVE_SITE,
+  //           3) Transship ID pattern, 4) Broad page scan (last resort)
   // ---------------------------------------------------------------------------
 
   function getCurrentFCCode() {
     try {
-      const pageText = document.body ? document.body.innerText : '';
       const siteKeys = Object.keys(SITE_CODE_MAP);
-      for (const key of siteKeys) {
-        if (pageText.includes(key)) return key;
+
+      // Strategy 1: Look for "Houdini FC: XXXX" text in a targeted element (top-right corner)
+      // This is the most reliable source — it's the explicit FC indicator on the page
+      const allElements = document.querySelectorAll('span, div, a, button, label, p');
+      for (const el of allElements) {
+        const text = el.textContent.trim();
+        const houdiniMatch = text.match(/Houdini\s+FC[:\s]+([A-Z0-9]{3,6})/i);
+        if (houdiniMatch && houdiniMatch[1]) {
+          const candidate = houdiniMatch[1].toUpperCase();
+          if (SITE_CODE_MAP[candidate]) return candidate;
+        }
       }
+
+      // Strategy 2: Check localStorage ACTIVE_SITE (set by user's session/store selection)
       const activeSiteData = localStorage.getItem('ACTIVE_SITE');
       if (activeSiteData) {
         const parsed = JSON.parse(activeSiteData);
         const fcId = parsed.fcId || parsed.storeAcronym || '';
         if (fcId && SITE_CODE_MAP[fcId]) return fcId;
       }
-    } catch (e) {}
+
+      // Strategy 3: Extract FC from Transship ID pattern (e.g., "HSE1_UNY4_141d...")
+      const transshipHeader = document.querySelector('h1, h2, h3, [class*="title"], [class*="header"]');
+      if (transshipHeader) {
+        const headerText = transshipHeader.textContent.trim();
+        const transshipMatch = headerText.match(/[A-Z]+\d*_([A-Z]{2,4}\d{1,2})_/i);
+        if (transshipMatch && transshipMatch[1]) {
+          const candidate = transshipMatch[1].toUpperCase();
+          if (SITE_CODE_MAP[candidate]) return candidate;
+        }
+      }
+
+      // Strategy 4 (last resort): Scan page text but require the FC code to appear
+      // in a meaningful context (near "FC", "Site", or "Store" keywords) to avoid
+      // false positives from random text matches
+      const pageText = document.body ? document.body.innerText : '';
+      for (const key of siteKeys) {
+        // Look for the FC code near contextual keywords to reduce false matches
+        const contextPattern = new RegExp('(?:FC|Site|Store|Warehouse)[:\\s]*' + key + '\\b', 'i');
+        if (contextPattern.test(pageText)) return key;
+      }
+
+      // Strategy 5: Absolute fallback — plain text match (original behavior)
+      // Only used if none of the above strategies found anything
+      for (const key of siteKeys) {
+        if (pageText.includes(key)) return key;
+      }
+    } catch (e) {
+      console.warn('[IHM Transship Shortage] Error detecting FC code:', e);
+    }
     return null;
   }
 
@@ -1480,7 +1512,37 @@
         'ReceiveV3',
         'ReceiveV3_Stow',
         'ReceiveV3_Stow_adhoc',
-        'ReceiveV3_Stow_prev_short'
+        'ReceiveV3_Stow_prev_short',
+        'RecV3_Andon_Destroyed',
+        'RecV3_Capacity_Destroyed',
+        'RecV3_Capacity_Distribute',
+        'RecV3_Capacity_Donated',
+        'RecV3_Culling_DMG_Disc_Destroy',
+        'RecV3_Culling_DMG_Disc_Donate',
+        'RecV3_Culling_DMG_Disc_Hazmat',
+        'RecV3_Culling_Rotten_Destroy',
+        'RecV3_Damaged_Destroyed',
+        'RecV3_Damaged_Distribute',
+        'RecV3_Damaged_Donated',
+        'RecV3_Damaged_Hazmat_Waste',
+        'RecV3_Expired_Destroyed',
+        'RecV3_Expired_Distribute',
+        'RecV3_Expired_Donated',
+        'RecV3_Expired_Hazmat_Waste',
+        'RecV3_Missing',
+        'RecV3_Nop_Cleanup_Destroyed',
+        'RecV3_Nop_Cleanup_Donated',
+        'RecV3_Recalled_Destroyed',
+        'RecV3_Reject_DMG_Disc_Destroy',
+        'RecV3_Reject_DMG_Disc_Distrib',
+        'RecV3_Reject_DMG_Disc_Donate',
+        'RecV3_Reject_DMG_Disc_Hazmat',
+        'RecV3_Reject_Exp_Destroy',
+        'RecV3_Reject_Exp_Donate',
+        'RecV3_Reject_Moldy_Destroy',
+        'RecV3_Reject_OOT_Destroy',
+        'RecV3_Reject_OOT_Distrib',
+        'RecV3_Store_Out_Temp_Destroy'
       ];
 
       // Find and click the dropdown trigger to open it
@@ -1918,7 +1980,7 @@
             .slice(0, 30);
           console.log('[Shortage Helper] Visible clickable elements (attempt ' + attempts + '):', visibleTexts);
         }
-
+        
         // Search in parent document — match "Stow" case-insensitively and also partial matches
         let found = false;
         const allEls = document.querySelectorAll('a, button, div, span, tr, td, li, [role="tab"], [role="button"], [role="menuitem"]');
@@ -1938,7 +2000,7 @@
             return;
           }
         }
-
+        
         // Search inside iframes
         if (!found) {
           const iframes = document.querySelectorAll('iframe');
@@ -1965,7 +2027,7 @@
             }
           }
         }
-
+        
         if (attempts >= 30) {
           clearInterval(interval);
           console.warn('[Shortage Helper] Stow option not found after 15s');
